@@ -1,0 +1,19 @@
+{
+  "name": "automationecs-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "@huaweicloud/huaweicloud-sdk-core": "^3.1.215",
+    "@huaweicloud/huaweicloud-sdk-ecs": "^3.1.215",
+    "@huaweicloud/huaweicloud-sdk-ims": "^3.1.215",
+    "@huaweicloud/huaweicloud-sdk-vpc": "^3.1.215",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "uuid": "^11.1.0"
+  }
+}

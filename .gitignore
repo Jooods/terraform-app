@@ -1,0 +1,14 @@
+node_modules/
+frontend/dist/
+backend/.work/
+backend/node_modules/
+frontend/node_modules/
+.env
+.env.*
+*.log
+.DS_Store
+.terraform/
+*.tfstate
+*.tfstate.*
+tfplan
+.terraform.lock.hcl
