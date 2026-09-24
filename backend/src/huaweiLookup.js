@@ -342,6 +342,89 @@ export async function listInstances(ak, sk, projectId, region) {
 }
 
 // ---------------------------------------------------------------------------
+// Creation functions
+// ---------------------------------------------------------------------------
+
+/**
+ * Create a new VPC.
+ * @param {string} ak @param {string} sk @param {string|undefined} projectId
+ * @param {string} region @param {{ name: string, cidr: string, description?: string }} opts
+ */
+export async function createVpc(ak, sk, projectId, region, { name, cidr, description }) {
+  const client = buildVpcClient(ak, sk, projectId, region);
+  const request = new VpcSdk.CreateVpcRequest();
+  const body = new VpcSdk.CreateVpcRequestBody();
+  const vpc = new VpcSdk.CreateVpcOption();
+  vpc.name = name;
+  vpc.cidr = cidr;
+  if (description) vpc.description = description;
+  body.vpc = vpc;
+  request.body = body;
+  const response = await client.createVpc(request);
+  const v = response.vpc;
+  return {
+    id: v.id,
+    name: v.name,
+    cidr: v.cidr,
+    status: v.status,
+  };
+}
+
+/**
+ * Create a new Subnet inside a VPC.
+ * @param {string} ak @param {string} sk @param {string|undefined} projectId
+ * @param {string} region
+ * @param {{ name: string, cidr: string, vpcId: string, gatewayIp?: string, dnsList?: string[] }} opts
+ */
+export async function createSubnet(ak, sk, projectId, region, { name, cidr, vpcId, gatewayIp, dnsList }) {
+  const client = buildVpcClient(ak, sk, projectId, region);
+  const request = new VpcSdk.CreateSubnetRequest();
+  const body = new VpcSdk.CreateSubnetRequestBody();
+  const subnet = new VpcSdk.CreateSubnetOption();
+  subnet.name = name;
+  subnet.cidr = cidr;
+  subnet.vpcId = vpcId;
+  if (gatewayIp) subnet.gatewayIp = gatewayIp;
+  if (dnsList && dnsList.length > 0) subnet.dnsList = dnsList;
+  body.subnet = subnet;
+  request.body = body;
+  const response = await client.createSubnet(request);
+  const s = response.subnet;
+  return {
+    id: s.id,
+    name: s.name,
+    cidr: s.cidr,
+    vpcId: s.vpcId,
+    gatewayIp: s.gatewayIp,
+    status: s.status,
+  };
+}
+
+/**
+ * Create a new Security Group.
+ * @param {string} ak @param {string} sk @param {string|undefined} projectId
+ * @param {string} region
+ * @param {{ name: string, description?: string }} opts
+ */
+export async function createSecurityGroup(ak, sk, projectId, region, { name, description }) {
+  const client = buildVpcClient(ak, sk, projectId, region);
+  const request = new VpcSdk.CreateSecurityGroupRequest();
+  const body = new VpcSdk.CreateSecurityGroupRequestBody();
+  const sg = new VpcSdk.CreateSecurityGroupOption();
+  sg.name = name;
+  if (description) sg.description = description;
+  body.securityGroup = sg;
+  request.body = body;
+  const response = await client.createSecurityGroup(request);
+  const g = response.securityGroup;
+  return {
+    id: g.id,
+    name: g.name,
+    description: g.description,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Dispatcher — call any lookup by resource name
 // ---------------------------------------------------------------------------
 

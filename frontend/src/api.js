@@ -50,3 +50,37 @@ export function startWindowsAutomation(payload) {
     body: JSON.stringify(payload),
   });
 }
+
+export function createVpc(payload) {
+  return request("/api/create-vpc", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function createSubnet(payload) {
+  return request("/api/create-subnet", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function createSecurityGroup(payload) {
+  return request("/api/create-security-group", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function startWindowsUploadAutomation(formData) {
+  const res = await fetch("/api/windows-automation-upload", {
+    method: "POST",
+    body: formData,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.error || `Upload request failed (${res.status})`);
+  }
+  return data;
+}
+

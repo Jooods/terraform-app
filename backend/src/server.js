@@ -4,8 +4,23 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { v4 as uuidv4 } from "uuid";
 import { runTerraformJob, terraformAvailable } from "./terraformWorker.js";
-import { runWindowsAutomationJob } from "./windowsWorker.js";
-import { lookup } from "./huaweiLookup.js";
+import { runWindowsAutomationJob, runWindowsUploadJob } from "./windowsWorker.js";
+import multer from "multer";
+import os from "node:os";
+import { lookup, createVpc, createSubnet, createSecurityGroup } from "./huaweiLookup.js";
+
+// Multer: store uploads in OS temp dir, accept only .zip, max 100 MB
+const upload = multer({
+  dest: os.tmpdir(),
+  limits: { fileSize: 100 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (file.mimetype === "application/zip" || file.originalname.toLowerCase().endsWith(".zip")) {
+      cb(null, true);
+    } else {
+      cb(new Error("Only .zip files are accepted for upload deployment."));
+    }
+  },
+});
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT) || 8787;
@@ -268,6 +283,75 @@ app.post("/api/lookup", async (req, res) => {
   res.status(result.ok ? 200 : 502).json(result);
 });
 
+// ── Network resource creation endpoints ──────────────────────────────────────
+
+const NETWORK_CRED_REQUIRED = ["accessKey", "secretKey", "region"];
+
+app.post("/api/create-vpc", async (req, res) => {
+  const missing = NETWORK_CRED_REQUIRED.filter((f) => !String(req.body?.[f] ?? "").trim());
+  if (missing.length) return res.status(400).json({ ok: false, error: `Missing: ${missing.join(", ")}` });
+  if (!String(req.body?.name ?? "").trim()) return res.status(400).json({ ok: false, error: "VPC name is required" });
+  if (!String(req.body?.cidr ?? "").trim()) return res.status(400).json({ ok: false, error: "CIDR block is required" });
+
+  try {
+    const vpc = await createVpc(
+      req.body.accessKey.trim(),
+      req.body.secretKey.trim(),
+      String(req.body.projectId || "").trim() || undefined,
+      req.body.region.trim(),
+      { name: req.body.name.trim(), cidr: req.body.cidr.trim(), description: String(req.body.description || "").trim() || undefined }
+    );
+    res.json({ ok: true, vpc });
+  } catch (err) {
+    const message = err?.errorMsg || err?.data?.error_msg || err?.data?.message || err?.message || String(err);
+    res.status(502).json({ ok: false, error: message });
+  }
+});
+
+app.post("/api/create-subnet", async (req, res) => {
+  const missing = [...NETWORK_CRED_REQUIRED, "name", "cidr", "vpcId"].filter((f) => !String(req.body?.[f] ?? "").trim());
+  if (missing.length) return res.status(400).json({ ok: false, error: `Missing: ${missing.join(", ")}` });
+
+  try {
+    const subnet = await createSubnet(
+      req.body.accessKey.trim(),
+      req.body.secretKey.trim(),
+      String(req.body.projectId || "").trim() || undefined,
+      req.body.region.trim(),
+      {
+        name: req.body.name.trim(),
+        cidr: req.body.cidr.trim(),
+        vpcId: req.body.vpcId.trim(),
+        gatewayIp: String(req.body.gatewayIp || "").trim() || undefined,
+        dnsList: Array.isArray(req.body.dnsList) ? req.body.dnsList : undefined,
+      }
+    );
+    res.json({ ok: true, subnet });
+  } catch (err) {
+    const message = err?.errorMsg || err?.data?.error_msg || err?.data?.message || err?.message || String(err);
+    res.status(502).json({ ok: false, error: message });
+  }
+});
+
+app.post("/api/create-security-group", async (req, res) => {
+  const missing = [...NETWORK_CRED_REQUIRED, "name"].filter((f) => !String(req.body?.[f] ?? "").trim());
+  if (missing.length) return res.status(400).json({ ok: false, error: `Missing: ${missing.join(", ")}` });
+
+  try {
+    const sg = await createSecurityGroup(
+      req.body.accessKey.trim(),
+      req.body.secretKey.trim(),
+      String(req.body.projectId || "").trim() || undefined,
+      req.body.region.trim(),
+      { name: req.body.name.trim(), description: String(req.body.description || "").trim() || undefined }
+    );
+    res.json({ ok: true, securityGroup: sg });
+  } catch (err) {
+    const message = err?.errorMsg || err?.data?.error_msg || err?.data?.message || err?.message || String(err);
+    res.status(502).json({ ok: false, error: message });
+  }
+});
+
 app.post("/api/validate", (req, res) => {
   // Never echo secrets back; body is validated then stripped from logs.
   const check = validateBody(req.body);
@@ -323,6 +407,85 @@ app.post("/api/windows-automation", (req, res) => {
 
   jobs.set(id, job);
   void executeWindowsJob(job);
+  res.status(202).json(publicJob(job));
+});
+
+// ── File upload mode: upload a zip, deploy directly to IIS ─────────────────
+app.post("/api/windows-automation-upload", upload.single("appZip"), async (req, res) => {
+  const { host, adminPass } = req.body || {};
+  if (!String(host || "").trim()) {
+    return res.status(400).json({ ok: false, error: "Host (Public IP) is required" });
+  }
+  if (!String(adminPass || "").trim()) {
+    return res.status(400).json({ ok: false, error: "Administrator password is required" });
+  }
+  if (!req.file) {
+    return res.status(400).json({ ok: false, error: "A .zip file is required (field: appZip)" });
+  }
+
+  const id = uuidv4();
+  const now = new Date().toISOString();
+  const job = {
+    id,
+    mode: "windows-upload",
+    status: "queued",
+    createdAt: now,
+    updatedAt: now,
+    logs: [],
+    error: null,
+    outputs: null,
+    config: {
+      host: String(host).trim(),
+      uploadedName: req.file.originalname,
+    },
+    _credentials: { adminPass: String(adminPass) },
+    _zipPath: req.file.path, // temp path on disk; cleaned up by worker
+  };
+
+  jobs.set(id, job);
+
+  // Run the upload job asynchronously
+  void (async () => {
+    job.status = "running";
+    job.updatedAt = new Date().toISOString();
+    appendLog(job, { level: "info", message: "windows-upload job started" });
+    try {
+      const result = await runWindowsUploadJob({
+        jobId: job.id,
+        host: job.config.host,
+        adminPass: job._credentials.adminPass,
+        zipPath: job._zipPath,
+        uploadedName: job.config.uploadedName,
+        onLog: (entry) => appendLog(job, entry),
+      });
+
+      job._credentials = null;
+
+      if (!result.ok) {
+        job.status = "failed";
+        job.error = result.error || "Upload deployment failed";
+        job.outputs = result.outputs || null;
+        if (result.script && job.outputs) job.outputs.script = result.script;
+        appendLog(job, { level: "error", message: job.error });
+        return;
+      }
+
+      job.status = "succeeded";
+      job.outputs = result.outputs;
+      if (result.script) job.outputs.script = result.script;
+      appendLog(job, { level: "info", message: `Upload deployment complete. Live URL: ${result.websiteUrl}` });
+    } catch (err) {
+      job._credentials = null;
+      job.status = "failed";
+      job.error = err?.message || String(err);
+      appendLog(job, { level: "error", message: job.error });
+    } finally {
+      job.updatedAt = new Date().toISOString();
+      // Clean up the temp uploaded zip
+      import("node:fs").then((fsMod) => fsMod.default.unlink(job._zipPath, () => {})).catch(() => {});
+    }
+  })();
+
   res.status(202).json(publicJob(job));
 });
 

@@ -191,6 +191,7 @@ Write-Host "====================================================================
 Write-Host "SUCCESS: IIS configured and static application deployed to C:\\inetpub\\wwwroot"
 Write-Host "========================================================================="
 Write-Host "[DEPLOYMENT_SUCCESS_CONFIRMED]"
+exit 0
 `;
 }
 
@@ -260,7 +261,7 @@ try {
 try {
     Write-Host "WinRM session established. Running deployment script on remote Windows server..."
     Invoke-Command -Session $session -FilePath '${localScriptPath.replace(/'/g, "''")}' -ErrorAction Stop
-    if ($LASTEXITCODE -ne 0) {
+    if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) {
         throw "Remote deployment script exited with code $LASTEXITCODE."
     }
     Remove-PSSession $session
@@ -391,6 +392,263 @@ try {
         ok: false,
         error: err.message,
       });
+    });
+  });
+}
+
+// =============================================================================
+// FILE UPLOAD MODE — deploy a locally uploaded zip to IIS (no GitHub needed)
+// =============================================================================
+
+/**
+ * Builds the PowerShell deployment script for a zip that was already
+ * base64-encoded and embedded into the script body itself.
+ * This avoids any internet access requirement on the ECS server.
+ */
+export function buildDeploymentScriptFromZip(base64Zip) {
+  return `
+# =========================================================================
+# Windows ECS Automation — IIS & Local Folder Deployment (Upload Mode)
+# =========================================================================
+$ProgressPreference = "SilentlyContinue"
+$ErrorActionPreference = "Stop"
+
+Write-Host ">>> [1/5] Checking and Installing IIS Web Server..."
+try {
+    $iisFeature = Get-WindowsFeature -Name Web-Server -ErrorAction Stop
+    if (-not $iisFeature.Installed) {
+        Write-Host "Installing IIS (Web-Server and Management Tools)..."
+        Install-WindowsFeature -Name Web-Server -IncludeManagementTools
+        Write-Host "IIS installed successfully."
+    } else {
+        Write-Host "IIS is already installed. Skipping install step."
+    }
+} catch {
+    Write-Host "WARNING: Could not check IIS status. Assuming IIS is installed."
+}
+
+Write-Host ">>> [2/5] Preparing web root at C:\\inetpub\\wwwroot..."
+if (-not (Test-Path "C:\\inetpub\\wwwroot")) {
+    New-Item -ItemType Directory -Path "C:\\inetpub\\wwwroot" -Force | Out-Null
+}
+if (Test-Path "C:\\inetpub\\wwwroot\\iisstart.htm") {
+    Remove-Item "C:\\inetpub\\wwwroot\\iisstart.htm" -Force -ErrorAction SilentlyContinue
+}
+if (Test-Path "C:\\inetpub\\wwwroot\\iisstart.png") {
+    Remove-Item "C:\\inetpub\\wwwroot\\iisstart.png" -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host ">>> [3/5] Decoding uploaded application zip..."
+$tempZip    = "$env:TEMP\\app_upload_$((Get-Random)).zip"
+$extractDir = "$env:TEMP\\app_extract_$((Get-Random))"
+
+$base64 = @"
+${base64Zip}
+"@
+[System.IO.File]::WriteAllBytes($tempZip, [System.Convert]::FromBase64String($base64.Trim()))
+Write-Host "Decoded zip written to $tempZip ($((Get-Item $tempZip).Length) bytes)."
+
+Write-Host ">>> [4/5] Extracting application files..."
+if (Test-Path $extractDir) { Remove-Item $extractDir -Recurse -Force }
+New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
+
+$extracted = $false
+if ($PSVersionTable.PSVersion.Major -ge 5) {
+    try {
+        Expand-Archive -Path $tempZip -DestinationPath $extractDir -Force
+        $extracted = $true
+        Write-Host "Extracted via Expand-Archive."
+    } catch { Write-Host "Expand-Archive failed: $($_.Exception.Message). Trying .NET fallback..." }
+}
+if (-not $extracted) {
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($tempZip, $extractDir)
+        $extracted = $true
+        Write-Host "Extracted via System.IO.Compression.ZipFile."
+    } catch { Write-Host ".NET ZipFile failed: $($_.Exception.Message)" }
+}
+if (-not $extracted) {
+    Write-Error "All extraction methods failed."
+    exit 1
+}
+
+# If the zip contained a single top-level folder, deploy its contents directly
+$children = Get-ChildItem -Path $extractDir
+$sourceDir = if ($children.Count -eq 1 -and $children[0].PSIsContainer) { $children[0].FullName } else { $extractDir }
+
+Write-Host "Deploying from $sourceDir to C:\\inetpub\\wwwroot..."
+Copy-Item -Path "$sourceDir\\*" -Destination "C:\\inetpub\\wwwroot" -Recurse -Force
+
+Remove-Item $tempZip -Force -ErrorAction SilentlyContinue
+Remove-Item $extractDir -Recurse -Force -ErrorAction SilentlyContinue
+
+Write-Host ">>> [5/5] Restarting IIS (W3SVC)..."
+Restart-Service W3SVC -Force
+$status = (Get-Service W3SVC).Status
+Write-Host "IIS Service status: $status"
+
+Write-Host ""
+Write-Host "========================================================================="
+Write-Host "SUCCESS: IIS configured and uploaded application deployed to C:\\inetpub\\wwwroot"
+Write-Host "========================================================================="
+Write-Host "[DEPLOYMENT_SUCCESS_CONFIRMED]"
+exit 0
+`;
+}
+
+/**
+ * Runs a Windows Automation job where the app zip is uploaded (not pulled from GitHub).
+ * The zip file bytes are base64-embedded directly inside the PowerShell deployment script.
+ *
+ * @param {{ jobId, host, adminPass, zipPath, uploadedName, onLog }} params
+ */
+export async function runWindowsUploadJob({
+  jobId,
+  host,
+  adminPass,
+  zipPath,
+  uploadedName,
+  onLog,
+}) {
+  if (!adminPass) {
+    return { ok: false, error: "Admin password is required for Windows deployment." };
+  }
+
+  onLog?.({ level: "info", message: `Starting file-upload Windows Automation for host: ${host}` });
+  onLog?.({ level: "info", message: `Upload source: ${uploadedName}` });
+
+  // 1. Read the uploaded zip and base64-encode it
+  let zipBytes;
+  try {
+    zipBytes = await fs.readFile(zipPath);
+  } catch (err) {
+    return { ok: false, error: `Failed to read uploaded zip: ${err.message}` };
+  }
+
+  if (zipBytes.length > 100 * 1024 * 1024) {
+    return { ok: false, error: "Uploaded file exceeds 100 MB limit." };
+  }
+
+  const base64Zip = zipBytes.toString("base64");
+  onLog?.({ level: "info", message: `Encoded zip (${(zipBytes.length / 1024).toFixed(0)} KB) for embedded transfer.` });
+
+  // 2. Build the self-contained deployment script
+  const scriptContent = buildDeploymentScriptFromZip(base64Zip);
+  onLog?.({ level: "info", message: "Generated PowerShell deployment script (upload mode)." });
+
+  // 3. Write temp script files
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "win_upload_"));
+  const localScriptPath = path.join(tmpDir, "deploy_upload.ps1");
+  const winrmScriptPath = path.join(tmpDir, "winrm_upload.ps1");
+  await fs.writeFile(localScriptPath, scriptContent, "utf8");
+
+  const winrmScript = `
+$ProgressPreference = "SilentlyContinue"
+Import-Module Microsoft.PowerShell.Security -ErrorAction SilentlyContinue
+$secPass = ConvertTo-SecureString '${adminPass.replace(/'/g, "''")}' -AsPlainText -Force
+$cred = New-Object System.Management.Automation.PSCredential ('Administrator', $secPass)
+$sessionOpt = New-PSSessionOption -SkipCACheck -SkipCNCheck
+
+try {
+    Write-Host "Testing WinRM connection to ${host}:5985..."
+    $session = New-PSSession -ComputerName '${host}' -Credential $cred -SessionOption $sessionOpt -ErrorAction Stop
+} catch {
+    Write-Host "[WINRM_UNAVAILABLE]: Remote WinRM connection could not be established ($($_.Exception.Message))."
+    exit 2
+}
+
+try {
+    Write-Host "WinRM session established. Running upload deployment script..."
+    Invoke-Command -Session $session -FilePath '${localScriptPath.replace(/'/g, "''")}' -ErrorAction Stop
+    if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) { throw "Remote script exited with code $LASTEXITCODE." }
+    Remove-PSSession $session
+    Write-Host "[DEPLOYMENT_SUCCESS_CONFIRMED]"
+    Write-Host "Remote execution completed."
+    exit 0
+} catch {
+    Write-Host "[DEPLOYMENT_FAILED]: $($_.Exception.Message)"
+    if ($session) { Remove-PSSession $session -ErrorAction SilentlyContinue }
+    exit 1
+}
+`;
+
+  await fs.writeFile(winrmScriptPath, winrmScript, "utf8");
+  onLog?.({ level: "info", message: `Attempting WinRM connection to ${host}...` });
+
+  return new Promise((resolve) => {
+    const child = spawn("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", winrmScriptPath], {
+      windowsHide: true,
+    });
+
+    let stdout = "";
+    let winrmFailed = false;
+
+    child.stdout.on("data", (data) => {
+      const text = data.toString();
+      stdout += text;
+      if (text.includes("[WINRM_UNAVAILABLE]")) winrmFailed = true;
+      for (const line of text.split(/\r?\n/)) {
+        if (line.trim()) onLog?.({ level: "info", message: line.trim() });
+      }
+    });
+
+    child.stderr.on("data", (data) => {
+      const text = data.toString();
+      for (const line of text.split(/\r?\n/)) {
+        if (line.trim()) onLog?.({ level: "warn", message: line.trim() });
+      }
+    });
+
+    child.on("close", async (code) => {
+      await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+      const websiteUrl = `http://${host}`;
+      const isSuccess =
+        code === 0 &&
+        !winrmFailed &&
+        stdout.includes("[DEPLOYMENT_SUCCESS_CONFIRMED]") &&
+        !stdout.includes("[DEPLOYMENT_FAILED]");
+
+      if (isSuccess) {
+        onLog?.({ level: "info", message: `Deployment complete! Website live at: ${websiteUrl}` });
+        return resolve({
+          ok: true,
+          mode: "winrm_upload",
+          websiteUrl,
+          outputs: { websiteUrl, host, source: uploadedName },
+        });
+      }
+
+      if (winrmFailed) {
+        onLog?.({ level: "warn", message: "WinRM port 5985 is blocked. Run the 1-Click PowerShell script manually on the server." });
+        return resolve({
+          ok: false,
+          mode: "script_ready",
+          error: "WinRM port 5985 is blocked. Use the generated script below on the server directly.",
+          websiteUrl,
+          script: scriptContent,
+          outputs: {
+            websiteUrl,
+            host,
+            source: uploadedName,
+            notice: "PowerShell script ready — paste into the server if WinRM is blocked.",
+          },
+        });
+      }
+
+      resolve({
+        ok: false,
+        error: "Upload deployment script failed on the remote server. Check the logs above.",
+        script: scriptContent,
+        websiteUrl,
+        outputs: { websiteUrl, host, source: uploadedName },
+      });
+    });
+
+    child.on("error", async (err) => {
+      await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+      onLog?.({ level: "error", message: `Automation process error: ${err.message}` });
+      resolve({ ok: false, error: err.message });
     });
   });
 }

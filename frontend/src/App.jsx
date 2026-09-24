@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback, useMemo } from "react";
-import { getHealth, getJob, startDeploy, startValidate, lookup, startWindowsAutomation } from "./api.js";
+import { getHealth, getJob, startDeploy, startValidate, lookup, startWindowsAutomation, startWindowsUploadAutomation, createVpc, createSubnet, createSecurityGroup } from "./api.js";
 import {
   AZ_BY_REGION,
   DISK_TYPES,
@@ -124,9 +124,11 @@ const EMPTY_WIN_FORM = {
   instanceId: "",
   host: "",
   adminPass: "",
+  sourceType: "github", // 'github' or 'file'
   repoUrl: "",
   branch: "main",
   githubToken: "",
+  appZipFile: null,
 };
 
 export default function App() {
@@ -160,6 +162,21 @@ export default function App() {
   const [winBusy, setWinBusy] = useState(false);
   const [winBanner, setWinBanner] = useState(null);
   const winPollRef = useRef(null);
+
+  // Network Setup tab state
+  const [netBanner, setNetBanner] = useState(null);
+  // VPC creation
+  const [vpcForm, setVpcForm] = useState({ name: "", cidr: "192.168.0.0/16", description: "" });
+  const [vpcCreating, setVpcCreating] = useState(false);
+  const [createdVpc, setCreatedVpc] = useState(null);
+  // Subnet creation
+  const [subnetForm, setSubnetForm] = useState({ name: "", cidr: "192.168.1.0/24", gatewayIp: "192.168.1.1", dnsList: "100.125.1.250,8.8.8.8" });
+  const [subnetCreating, setSubnetCreating] = useState(false);
+  const [createdSubnet, setCreatedSubnet] = useState(null);
+  // Security Group creation
+  const [sgForm, setSgForm] = useState({ name: "", description: "" });
+  const [sgCreating, setSgCreating] = useState(false);
+  const [createdSg, setCreatedSg] = useState(null);
 
   useEffect(() => {
     return () => {
@@ -402,7 +419,13 @@ export default function App() {
     const errs = {};
     if (!winForm.host.trim()) errs.host = "Required";
     if (!winForm.adminPass.trim()) errs.adminPass = "Required";
-    if (!winForm.repoUrl.trim()) errs.repoUrl = "Required";
+
+    if (winForm.sourceType === "github") {
+      if (!winForm.repoUrl.trim()) errs.repoUrl = "Required";
+    } else if (winForm.sourceType === "file") {
+      if (!winForm.appZipFile) errs.appZipFile = "Please select a .zip file";
+    }
+
     setWinErrors(errs);
     if (Object.keys(errs).length) {
       setWinBanner({ type: "error", text: "Fix the highlighted fields before continuing." });
@@ -411,13 +434,22 @@ export default function App() {
     setWinBusy(true);
     setWinBanner(null);
     try {
-      const created = await startWindowsAutomation({
-        host: winForm.host.trim(),
-        adminPass: winForm.adminPass,
-        repoUrl: winForm.repoUrl.trim(),
-        branch: winForm.branch.trim() || "main",
-        githubToken: winForm.githubToken.trim() || undefined,
-      });
+      let created;
+      if (winForm.sourceType === "github") {
+        created = await startWindowsAutomation({
+          host: winForm.host.trim(),
+          adminPass: winForm.adminPass,
+          repoUrl: winForm.repoUrl.trim(),
+          branch: winForm.branch.trim() || "main",
+          githubToken: winForm.githubToken.trim() || undefined,
+        });
+      } else {
+        const formData = new FormData();
+        formData.append("host", winForm.host.trim());
+        formData.append("adminPass", winForm.adminPass);
+        formData.append("appZip", winForm.appZipFile);
+        created = await startWindowsUploadAutomation(formData);
+      }
       setWinJob(created);
       startWinPolling(created.id);
     } catch (err) {
@@ -561,6 +593,14 @@ export default function App() {
         </button>
         <button
           role="tab"
+          aria-selected={activeTab === "network"}
+          className={`nav-tab ${activeTab === "network" ? "active" : ""}`}
+          onClick={() => setActiveTab("network")}
+        >
+          🔒 Network Setup
+        </button>
+        <button
+          role="tab"
           aria-selected={activeTab === "windows"}
           className={`nav-tab ${activeTab === "windows" ? "active" : ""}`}
           onClick={() => setActiveTab("windows")}
@@ -573,6 +613,13 @@ export default function App() {
       {activeTab === "provision" && banner && (
         <div className={`banner ${banner.type}`} role="alert">
           {banner.text}
+        </div>
+      )}
+
+      {/* Network Tab banners */}
+      {activeTab === "network" && netBanner && (
+        <div className={`banner ${netBanner.type}`} role="alert">
+          {netBanner.text}
         </div>
       )}
 
@@ -1122,9 +1169,9 @@ export default function App() {
           <form className="win-section" onSubmit={submitWindowsAutomation}>
             <h3>3 · IIS Deployment Configuration</h3>
             <p className="section-help">
-              Enter the Windows server public IP, Administrator password, and your GitHub repository URL.
-              The automation will install IIS and deploy your static web app automatically.
+              Enter the Windows server public IP and Administrator password, choose your application source (GitHub repository or direct file upload), and launch automation.
             </p>
+
             <div className="grid two">
               <Field
                 label="Windows Server Public IP"
@@ -1143,31 +1190,120 @@ export default function App() {
                 autoComplete="new-password"
                 onChange={setWinField}
               />
-              <Field
-                label="GitHub Repository URL"
-                name="repoUrl"
-                value={winForm.repoUrl}
-                error={winErrors.repoUrl}
-                placeholder="https://github.com/owner/repo  or  owner/repo"
-                onChange={setWinField}
-              />
-              <Field
-                label="Branch (default: main)"
-                name="branch"
-                value={winForm.branch}
-                onChange={setWinField}
-                placeholder="main"
-              />
-              <Field
-                label="GitHub Token (for private repos)"
-                name="githubToken"
-                value={winForm.githubToken}
-                type="password"
-                autoComplete="new-password"
-                placeholder="Optional — leave blank for public repos"
-                onChange={setWinField}
-              />
             </div>
+
+            {/* Application Source Selection */}
+            <div style={{ margin: "1.2rem 0" }}>
+              <label style={{ fontWeight: 600, display: "block", marginBottom: "0.6rem" }}>
+                Application Source
+              </label>
+              <div style={{ display: "flex", gap: "1rem" }}>
+                <label
+                  style={{
+                    flex: 1,
+                    padding: "0.8rem 1rem",
+                    borderRadius: "8px",
+                    border: `2px solid ${winForm.sourceType === "github" ? "var(--accent)" : "var(--border)"}`,
+                    background: winForm.sourceType === "github" ? "rgba(99, 102, 241, 0.08)" : "transparent",
+                    cursor: "pointer",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "0.6rem",
+                    transition: "all 0.2s ease"
+                  }}
+                >
+                  <input
+                    type="radio"
+                    name="sourceType"
+                    value="github"
+                    checked={winForm.sourceType === "github"}
+                    onChange={(e) => setWinField("sourceType", e.target.value)}
+                  />
+                  <span>📦 GitHub Repository</span>
+                </label>
+                <label
+                  style={{
+                    flex: 1,
+                    padding: "0.8rem 1rem",
+                    borderRadius: "8px",
+                    border: `2px solid ${winForm.sourceType === "file" ? "var(--accent)" : "var(--border)"}`,
+                    background: winForm.sourceType === "file" ? "rgba(99, 102, 241, 0.08)" : "transparent",
+                    cursor: "pointer",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "0.6rem",
+                    transition: "all 0.2s ease"
+                  }}
+                >
+                  <input
+                    type="radio"
+                    name="sourceType"
+                    value="file"
+                    checked={winForm.sourceType === "file"}
+                    onChange={(e) => setWinField("sourceType", e.target.value)}
+                  />
+                  <span>📁 Upload Zip Folder</span>
+                </label>
+              </div>
+            </div>
+
+            {winForm.sourceType === "github" ? (
+              <div className="grid two">
+                <Field
+                  label="GitHub Repository URL"
+                  name="repoUrl"
+                  value={winForm.repoUrl}
+                  error={winErrors.repoUrl}
+                  placeholder="https://github.com/owner/repo  or  owner/repo"
+                  onChange={setWinField}
+                />
+                <Field
+                  label="Branch (default: main)"
+                  name="branch"
+                  value={winForm.branch}
+                  onChange={setWinField}
+                  placeholder="main"
+                />
+                <Field
+                  label="GitHub Token (for private repos)"
+                  name="githubToken"
+                  value={winForm.githubToken}
+                  type="password"
+                  autoComplete="new-password"
+                  placeholder="Optional — leave blank for public repos"
+                  onChange={setWinField}
+                />
+              </div>
+            ) : (
+              <div style={{ background: "var(--surface-hover)", padding: "1.2rem", borderRadius: "8px", marginTop: "1rem" }}>
+                <label style={{ fontWeight: 600, display: "block", marginBottom: "0.4rem" }}>
+                  Upload Static Web App (.zip)
+                </label>
+                <p style={{ fontSize: "0.85rem", color: "var(--muted)", marginBottom: "0.8rem" }}>
+                  Zip your static web application folder (containing <code>index.html</code>, <code>css/</code>, <code>js/</code>, etc.). It will be unzipped and deployed directly to IIS <code>C:\inetpub\wwwroot</code>.
+                </p>
+                <input
+                  type="file"
+                  accept=".zip"
+                  style={{ display: "block", width: "100%", padding: "0.5rem", borderRadius: "6px", border: "1px solid var(--border)", background: "var(--bg)" }}
+                  onChange={(e) => {
+                    const file = e.target.files?.[0] || null;
+                    setWinField("appZipFile", file);
+                  }}
+                />
+                {winErrors.appZipFile && (
+                  <span style={{ color: "var(--error)", fontSize: "0.85rem", marginTop: "0.4rem", display: "block" }}>
+                    {winErrors.appZipFile}
+                  </span>
+                )}
+                {winForm.appZipFile && (
+                  <div style={{ fontSize: "0.85rem", color: "var(--accent)", marginTop: "0.5rem" }}>
+                    Selected: <strong>{winForm.appZipFile.name}</strong> ({(winForm.appZipFile.size / 1024 / 1024).toFixed(2)} MB)
+                  </div>
+                )}
+              </div>
+            )}
+
             <div className="actions">
               <button type="submit" className="btn primary" disabled={winBusy}>
                 {winBusy ? <><span className="spinner" /> Running automation…</> : "🚀 Deploy to Windows ECS"}
@@ -1239,6 +1375,388 @@ export default function App() {
                     <pre>{line.message}</pre>
                   </div>
                 ))}
+              </div>
+            </div>
+          )}
+
+        </div>
+      )}
+
+      {/* ── Network Setup Tab ── */}
+      {activeTab === "network" && (
+        <div className="layout" style={{ display: "flex", flexDirection: "column", gap: "1.5rem" }}>
+
+          {/* Shared credentials notice */}
+          <div className="panel" style={{ padding: "1.1rem 1.4rem" }}>
+            <p style={{ margin: 0, color: "var(--muted)", fontSize: "0.9rem", lineHeight: 1.55 }}>
+              <strong style={{ color: "var(--accent)" }}>ℹ️ Shared credentials</strong> — this tab uses the
+              <strong> AK, SK, Project ID, and Region</strong> from the
+              <button
+                type="button"
+                className="btn-link"
+                style={{ margin: "0 0.3em" }}
+                onClick={() => setActiveTab("provision")}
+              >Provision ECS</button>
+              tab. Fill those in first.
+              {form.region ? (
+                <span> Current region: <code style={{ color: "var(--accent)" }}>{form.region}</code></span>
+              ) : (
+                <span style={{ color: "var(--warn)" }}> ⚠️ Region not set yet.</span>
+              )}
+            </p>
+          </div>
+
+          {/* ── Step 1: Create VPC ── */}
+          <div className="panel form">
+            <section>
+              <h2>Step 1 — Create VPC</h2>
+              <p className="section-help">
+                A Virtual Private Cloud (VPC) is the isolated network that all your ECS instances live inside.
+                Pick a CIDR that doesn't overlap with other networks you need to peer with.
+              </p>
+              {createdVpc ? (
+                <div className="net-result-card">
+                  <span className="pill ok">✓ VPC created</span>
+                  <dl className="outputs" style={{ marginTop: "0.75rem" }}>
+                    <div><dt>Name</dt><dd className="mono">{createdVpc.name}</dd></div>
+                    <div><dt>ID</dt><dd className="mono">{createdVpc.id}</dd></div>
+                    <div><dt>CIDR</dt><dd className="mono">{createdVpc.cidr}</dd></div>
+                    <div><dt>Status</dt><dd className="mono">{createdVpc.status}</dd></div>
+                  </dl>
+                  <div style={{ display: "flex", gap: "0.75rem", marginTop: "0.85rem", flexWrap: "wrap" }}>
+                    <button
+                      type="button"
+                      className="btn"
+                      onClick={() => {
+                        setField("vpcId", createdVpc.id);
+                        setNetBanner({ type: "ok", text: `VPC ID "${createdVpc.id}" auto-filled in the Provision ECS form.` });
+                      }}
+                    >
+                      ⬆ Auto-fill VPC ID in ECS form
+                    </button>
+                    <button
+                      type="button"
+                      className="btn"
+                      style={{ background: "var(--bg2)", color: "var(--muted)" }}
+                      onClick={() => setCreatedVpc(null)}
+                    >
+                      Create another VPC
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <form
+                  onSubmit={async (e) => {
+                    e.preventDefault();
+                    if (!form.accessKey || !form.secretKey || !form.region) {
+                      setNetBanner({ type: "error", text: "Fill in AK, SK, and Region in the Provision ECS tab first." });
+                      return;
+                    }
+                    setVpcCreating(true);
+                    setNetBanner(null);
+                    try {
+                      const res = await createVpc({
+                        accessKey: form.accessKey.trim(),
+                        secretKey: form.secretKey.trim(),
+                        projectId: form.projectId || undefined,
+                        region: form.region.trim(),
+                        name: vpcForm.name.trim(),
+                        cidr: vpcForm.cidr.trim(),
+                        description: vpcForm.description.trim() || undefined,
+                      });
+                      setCreatedVpc(res.vpc);
+                      setNetBanner({ type: "ok", text: `VPC "${res.vpc.name}" created successfully (ID: ${res.vpc.id}).` });
+                    } catch (err) {
+                      setNetBanner({ type: "error", text: `Failed to create VPC: ${err.message}` });
+                    } finally {
+                      setVpcCreating(false);
+                    }
+                  }}
+                >
+                  <div className="grid two">
+                    <Field
+                      label="VPC Name"
+                      name="vpcName"
+                      value={vpcForm.name}
+                      placeholder="e.g. my-vpc"
+                      onChange={(_, v) => setVpcForm((p) => ({ ...p, name: v }))}
+                    />
+                    <Field
+                      label="CIDR Block"
+                      name="vpcCidr"
+                      value={vpcForm.cidr}
+                      placeholder="e.g. 192.168.0.0/16"
+                      onChange={(_, v) => setVpcForm((p) => ({ ...p, cidr: v }))}
+                    />
+                    <Field
+                      label="Description (optional)"
+                      name="vpcDescription"
+                      value={vpcForm.description}
+                      placeholder="e.g. Production VPC"
+                      onChange={(_, v) => setVpcForm((p) => ({ ...p, description: v }))}
+                    />
+                  </div>
+                  <div className="form-actions">
+                    <button type="submit" className="btn primary" disabled={vpcCreating || !vpcForm.name.trim() || !vpcForm.cidr.trim()}>
+                      {vpcCreating ? <><span className="spinner" /> Creating…</> : "Create VPC"}
+                    </button>
+                  </div>
+                </form>
+              )}
+            </section>
+          </div>
+
+          {/* ── Step 2: Create Subnet ── */}
+          <div className="panel form">
+            <section>
+              <h2>Step 2 — Create Subnet</h2>
+              <p className="section-help">
+                A Subnet carves up your VPC CIDR. Every ECS instance is launched into a subnet.
+                You need the VPC ID from Step 1 (or an existing one).
+              </p>
+              {createdSubnet ? (
+                <div className="net-result-card">
+                  <span className="pill ok">✓ Subnet created</span>
+                  <dl className="outputs" style={{ marginTop: "0.75rem" }}>
+                    <div><dt>Name</dt><dd className="mono">{createdSubnet.name}</dd></div>
+                    <div><dt>ID</dt><dd className="mono">{createdSubnet.id}</dd></div>
+                    <div><dt>CIDR</dt><dd className="mono">{createdSubnet.cidr}</dd></div>
+                    <div><dt>Gateway</dt><dd className="mono">{createdSubnet.gatewayIp}</dd></div>
+                    <div><dt>Status</dt><dd className="mono">{createdSubnet.status}</dd></div>
+                  </dl>
+                  <div style={{ display: "flex", gap: "0.75rem", marginTop: "0.85rem", flexWrap: "wrap" }}>
+                    <button
+                      type="button"
+                      className="btn"
+                      onClick={() => {
+                        setField("subnetId", createdSubnet.id);
+                        setNetBanner({ type: "ok", text: `Subnet ID "${createdSubnet.id}" auto-filled in the Provision ECS form.` });
+                      }}
+                    >
+                      ⬆ Auto-fill Subnet ID in ECS form
+                    </button>
+                    <button
+                      type="button"
+                      className="btn"
+                      style={{ background: "var(--bg2)", color: "var(--muted)" }}
+                      onClick={() => setCreatedSubnet(null)}
+                    >
+                      Create another Subnet
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <form
+                  onSubmit={async (e) => {
+                    e.preventDefault();
+                    if (!form.accessKey || !form.secretKey || !form.region) {
+                      setNetBanner({ type: "error", text: "Fill in AK, SK, and Region in the Provision ECS tab first." });
+                      return;
+                    }
+                    if (!subnetForm.vpcId.trim()) {
+                      setNetBanner({ type: "error", text: "VPC ID is required. Create a VPC in Step 1 or paste an existing ID." });
+                      return;
+                    }
+                    setSubnetCreating(true);
+                    setNetBanner(null);
+                    try {
+                      const dnsList = subnetForm.dnsList
+                        ? subnetForm.dnsList.split(",").map((s) => s.trim()).filter(Boolean)
+                        : undefined;
+                      const res = await createSubnet({
+                        accessKey: form.accessKey.trim(),
+                        secretKey: form.secretKey.trim(),
+                        projectId: form.projectId || undefined,
+                        region: form.region.trim(),
+                        name: subnetForm.name.trim(),
+                        cidr: subnetForm.cidr.trim(),
+                        vpcId: subnetForm.vpcId.trim(),
+                        gatewayIp: subnetForm.gatewayIp.trim() || undefined,
+                        dnsList,
+                      });
+                      setCreatedSubnet(res.subnet);
+                      setNetBanner({ type: "ok", text: `Subnet "${res.subnet.name}" created successfully (ID: ${res.subnet.id}).` });
+                    } catch (err) {
+                      setNetBanner({ type: "error", text: `Failed to create Subnet: ${err.message}` });
+                    } finally {
+                      setSubnetCreating(false);
+                    }
+                  }}
+                >
+                  <div className="grid two">
+                    <Field
+                      label="Subnet Name"
+                      name="subnetName"
+                      value={subnetForm.name}
+                      placeholder="e.g. my-subnet"
+                      onChange={(_, v) => setSubnetForm((p) => ({ ...p, name: v }))}
+                    />
+                    <Field
+                      label="Subnet CIDR"
+                      name="subnetCidr"
+                      value={subnetForm.cidr}
+                      placeholder="e.g. 192.168.1.0/24"
+                      onChange={(_, v) => setSubnetForm((p) => ({ ...p, cidr: v }))}
+                    />
+                    <Field
+                      label="VPC ID"
+                      name="subnetVpcId"
+                      value={subnetForm.vpcId || (createdVpc ? createdVpc.id : "")}
+                      placeholder={createdVpc ? createdVpc.id : "Paste VPC ID or create in Step 1"}
+                      onChange={(_, v) => setSubnetForm((p) => ({ ...p, vpcId: v }))}
+                    />
+                    <Field
+                      label="Gateway IP"
+                      name="subnetGw"
+                      value={subnetForm.gatewayIp}
+                      placeholder="e.g. 192.168.1.1"
+                      onChange={(_, v) => setSubnetForm((p) => ({ ...p, gatewayIp: v }))}
+                    />
+                    <Field
+                      label="DNS Servers (comma-separated)"
+                      name="subnetDns"
+                      value={subnetForm.dnsList}
+                      placeholder="100.125.1.250,8.8.8.8"
+                      onChange={(_, v) => setSubnetForm((p) => ({ ...p, dnsList: v }))}
+                    />
+                  </div>
+                  {createdVpc && !subnetForm.vpcId && (
+                    <div style={{ marginBottom: "0.75rem" }}>
+                      <button
+                        type="button"
+                        className="btn"
+                        style={{ fontSize: "0.85rem", padding: "0.4rem 0.9rem" }}
+                        onClick={() => setSubnetForm((p) => ({ ...p, vpcId: createdVpc.id }))}
+                      >
+                        ← Use VPC from Step 1 ({createdVpc.id.slice(0, 12)}…)
+                      </button>
+                    </div>
+                  )}
+                  <div className="form-actions">
+                    <button type="submit" className="btn primary" disabled={subnetCreating || !subnetForm.name.trim() || !subnetForm.cidr.trim()}>
+                      {subnetCreating ? <><span className="spinner" /> Creating…</> : "Create Subnet"}
+                    </button>
+                  </div>
+                </form>
+              )}
+            </section>
+          </div>
+
+          {/* ── Step 3: Create Security Group ── */}
+          <div className="panel form">
+            <section>
+              <h2>Step 3 — Create Security Group</h2>
+              <p className="section-help">
+                A Security Group acts as a virtual firewall for your ECS instances, controlling inbound and
+                outbound traffic. Default rules will be created automatically — you can refine them in the
+                Huawei Cloud Console afterwards.
+              </p>
+              {createdSg ? (
+                <div className="net-result-card">
+                  <span className="pill ok">✓ Security Group created</span>
+                  <dl className="outputs" style={{ marginTop: "0.75rem" }}>
+                    <div><dt>Name</dt><dd className="mono">{createdSg.name}</dd></div>
+                    <div><dt>ID</dt><dd className="mono">{createdSg.id}</dd></div>
+                    {createdSg.description && <div><dt>Description</dt><dd className="mono">{createdSg.description}</dd></div>}
+                  </dl>
+                  <div style={{ display: "flex", gap: "0.75rem", marginTop: "0.85rem", flexWrap: "wrap" }}>
+                    <button
+                      type="button"
+                      className="btn"
+                      onClick={() => {
+                        setField("securityGroupId", createdSg.id);
+                        setNetBanner({ type: "ok", text: `Security Group ID "${createdSg.id}" auto-filled in the Provision ECS form.` });
+                      }}
+                    >
+                      ⬆ Auto-fill Security Group ID in ECS form
+                    </button>
+                    <button
+                      type="button"
+                      className="btn"
+                      style={{ background: "var(--bg2)", color: "var(--muted)" }}
+                      onClick={() => setCreatedSg(null)}
+                    >
+                      Create another Security Group
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <form
+                  onSubmit={async (e) => {
+                    e.preventDefault();
+                    if (!form.accessKey || !form.secretKey || !form.region) {
+                      setNetBanner({ type: "error", text: "Fill in AK, SK, and Region in the Provision ECS tab first." });
+                      return;
+                    }
+                    setSgCreating(true);
+                    setNetBanner(null);
+                    try {
+                      const res = await createSecurityGroup({
+                        accessKey: form.accessKey.trim(),
+                        secretKey: form.secretKey.trim(),
+                        projectId: form.projectId || undefined,
+                        region: form.region.trim(),
+                        name: sgForm.name.trim(),
+                        description: sgForm.description.trim() || undefined,
+                      });
+                      setCreatedSg(res.securityGroup);
+                      setNetBanner({ type: "ok", text: `Security Group "${res.securityGroup.name}" created successfully (ID: ${res.securityGroup.id}).` });
+                    } catch (err) {
+                      setNetBanner({ type: "error", text: `Failed to create Security Group: ${err.message}` });
+                    } finally {
+                      setSgCreating(false);
+                    }
+                  }}
+                >
+                  <div className="grid two">
+                    <Field
+                      label="Security Group Name"
+                      name="sgName"
+                      value={sgForm.name}
+                      placeholder="e.g. my-web-sg"
+                      onChange={(_, v) => setSgForm((p) => ({ ...p, name: v }))}
+                    />
+                    <Field
+                      label="Description (optional)"
+                      name="sgDescription"
+                      value={sgForm.description}
+                      placeholder="e.g. Allow HTTP and RDP"
+                      onChange={(_, v) => setSgForm((p) => ({ ...p, description: v }))}
+                    />
+                  </div>
+                  <div className="form-actions">
+                    <button type="submit" className="btn primary" disabled={sgCreating || !sgForm.name.trim()}>
+                      {sgCreating ? <><span className="spinner" /> Creating…</> : "Create Security Group"}
+                    </button>
+                  </div>
+                </form>
+              )}
+            </section>
+          </div>
+
+          {/* ── Summary & Go to ECS Provision ── */}
+          {(createdVpc || createdSubnet || createdSg) && (
+            <div className="panel" style={{ padding: "1.2rem 1.4rem" }}>
+              <h2 style={{ marginTop: 0, marginBottom: "0.75rem" }}>📋 Summary — Created Resources</h2>
+              <dl className="outputs">
+                {createdVpc && <div><dt>VPC ID</dt><dd className="mono">{createdVpc.id}</dd></div>}
+                {createdSubnet && <div><dt>Subnet ID</dt><dd className="mono">{createdSubnet.id}</dd></div>}
+                {createdSg && <div><dt>Security Group ID</dt><dd className="mono">{createdSg.id}</dd></div>}
+              </dl>
+              <div style={{ marginTop: "1rem", display: "flex", gap: "0.75rem", flexWrap: "wrap" }}>
+                <button
+                  type="button"
+                  className="btn primary"
+                  onClick={() => {
+                    if (createdVpc) setField("vpcId", createdVpc.id);
+                    if (createdSubnet) setField("subnetId", createdSubnet.id);
+                    if (createdSg) setField("securityGroupId", createdSg.id);
+                    setActiveTab("provision");
+                    setBanner({ type: "ok", text: "Network IDs auto-filled from Network Setup. Ready to provision!" });
+                  }}
+                >
+                  ✅ Auto-fill all IDs &amp; go to Provision ECS
+                </button>
               </div>
             </div>
           )}
