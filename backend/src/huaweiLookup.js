@@ -401,12 +401,12 @@ export async function createSubnet(ak, sk, projectId, region, { name, cidr, vpcI
 }
 
 /**
- * Create a new Security Group.
+ * Create a new Security Group and configure security group rules.
  * @param {string} ak @param {string} sk @param {string|undefined} projectId
  * @param {string} region
- * @param {{ name: string, description?: string }} opts
+ * @param {{ name: string, description?: string, rules?: Array<{ direction?: string, ethertype?: string, protocol?: string, portRange?: string, remoteIpPrefix?: string }> }} opts
  */
-export async function createSecurityGroup(ak, sk, projectId, region, { name, description }) {
+export async function createSecurityGroup(ak, sk, projectId, region, { name, description, rules }) {
   const client = buildVpcClient(ak, sk, projectId, region);
   const request = new VpcSdk.CreateSecurityGroupRequest();
   const body = new VpcSdk.CreateSecurityGroupRequestBody();
@@ -417,10 +417,74 @@ export async function createSecurityGroup(ak, sk, projectId, region, { name, des
   request.body = body;
   const response = await client.createSecurityGroup(request);
   const g = response.securityGroup;
+  const createdRules = [];
+
+  if (rules && Array.isArray(rules) && rules.length > 0) {
+    for (const ruleItem of rules) {
+      const direction = ruleItem.direction || "ingress";
+      const ethertype = ruleItem.ethertype || "IPv4";
+      const protocol = ruleItem.protocol || "all";
+      const rawPrefixes = String(ruleItem.remoteIpPrefix || "0.0.0.0/0").split(",");
+
+      for (let rawPrefix of rawPrefixes) {
+        let prefix = rawPrefix.trim();
+        if (!prefix) continue;
+        if (!prefix.includes("/")) {
+          prefix = prefix === "0.0.0.0" ? "0.0.0.0/0" : `${prefix}/32`;
+        }
+
+        try {
+          const ruleReq = new VpcSdk.CreateSecurityGroupRuleRequest();
+          const ruleBody = new VpcSdk.CreateSecurityGroupRuleRequestBody();
+          const opt = new VpcSdk.CreateSecurityGroupRuleOption();
+          opt.securityGroupId = g.id;
+          opt.direction = direction;
+          opt.ethertype = ethertype;
+
+          if (protocol !== "all") {
+            opt.protocol = protocol;
+          }
+
+          if (ruleItem.portRange && protocol !== "all" && protocol !== "icmp") {
+            const rangeStr = String(ruleItem.portRange).trim();
+            if (rangeStr.includes("-")) {
+              const parts = rangeStr.split("-").map((p) => Number(p.trim()));
+              if (Number.isFinite(parts[0])) opt.portRangeMin = parts[0];
+              if (Number.isFinite(parts[1])) opt.portRangeMax = parts[1];
+            } else if (Number.isFinite(Number(rangeStr))) {
+              const portNum = Number(rangeStr);
+              opt.portRangeMin = portNum;
+              opt.portRangeMax = portNum;
+            }
+          }
+
+          opt.remoteIpPrefix = prefix;
+          ruleBody.securityGroupRule = opt;
+          ruleReq.body = ruleBody;
+
+          const ruleRes = await client.createSecurityGroupRule(ruleReq);
+          if (ruleRes.securityGroupRule) {
+            createdRules.push({
+              id: ruleRes.securityGroupRule.id,
+              direction,
+              ethertype,
+              protocol,
+              portRange: ruleItem.portRange || "1-65535",
+              remoteIpPrefix: prefix,
+            });
+          }
+        } catch (ruleErr) {
+          console.warn("Notice when adding security group rule:", ruleErr?.errorMsg || ruleErr?.message || ruleErr);
+        }
+      }
+    }
+  }
+
   return {
     id: g.id,
     name: g.name,
     description: g.description,
+    rules: createdRules,
   };
 }
 

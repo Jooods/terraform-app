@@ -639,28 +639,32 @@ body {
   z-index: 1;
 }
 
-/* ── Windows Automation Panel ─────────────────────────────── */
-.win-panel {
+/* ── Windows & Linux Automation Panels ────────────────────── */
+.win-panel,
+.linux-panel {
   display: flex;
   flex-direction: column;
   gap: 1.5rem;
 }
 
-.win-section {
+.win-section,
+.linux-section {
   background: var(--bg2);
   border: 1px solid var(--line);
   border-radius: var(--radius);
   padding: 1.5rem;
 }
 
-.win-section h3 {
+.win-section h3,
+.linux-section h3 {
   margin: 0 0 0.5rem;
   font-size: 1rem;
   color: var(--accent);
   font-weight: 600;
 }
 
-.win-section .section-help {
+.win-section .section-help,
+.linux-section .section-help {
   margin: 0 0 1rem;
   font-size: 0.83rem;
   color: var(--muted);

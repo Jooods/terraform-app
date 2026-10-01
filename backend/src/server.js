@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { v4 as uuidv4 } from "uuid";
 import { runTerraformJob, terraformAvailable } from "./terraformWorker.js";
 import { runWindowsAutomationJob, runWindowsUploadJob } from "./windowsWorker.js";
+import { runLinuxAutomationJob, runLinuxUploadJob } from "./linuxWorker.js";
 import multer from "multer";
 import os from "node:os";
 import { lookup, createVpc, createSubnet, createSecurityGroup } from "./huaweiLookup.js";
@@ -232,6 +233,56 @@ async function executeWindowsJob(job) {
   }
 }
 
+async function executeLinuxJob(job) {
+  job.status = "running";
+  job.updatedAt = new Date().toISOString();
+  appendLog(job, { level: "info", message: `Linux Automation Job started for ${job.config.host}` });
+
+  try {
+    const result = await runLinuxAutomationJob({
+      jobId: job.id,
+      host: job.config.host,
+      username: job.config.username || "root",
+      password: job._credentials.password,
+      privateKey: job._credentials.privateKey,
+      repoUrl: job.config.repoUrl,
+      branch: job.config.branch || "main",
+      githubToken: job.config.githubToken || "",
+      onLog: (entry) => appendLog(job, entry),
+    });
+
+    job._credentials = null;
+
+    if (!result.ok) {
+      job.status = "failed";
+      job.error = result.error || "Linux automation failed";
+      job.outputs = result.outputs || null;
+      if (result.script && job.outputs) {
+        job.outputs.script = result.script;
+      }
+      appendLog(job, { level: "error", message: job.error });
+      return;
+    }
+
+    job.status = "succeeded";
+    job.outputs = result.outputs;
+    if (result.script) {
+      job.outputs.script = result.script;
+    }
+    appendLog(job, {
+      level: "info",
+      message: `Linux automation completed. Live URL: ${result.websiteUrl}`,
+    });
+  } catch (err) {
+    job._credentials = null;
+    job.status = "failed";
+    job.error = err?.message || String(err);
+    appendLog(job, { level: "error", message: job.error });
+  } finally {
+    job.updatedAt = new Date().toISOString();
+  }
+}
+
 const app = express();
 app.use(cors({ origin: true }));
 app.use(express.json({ limit: "256kb" }));
@@ -333,6 +384,17 @@ app.post("/api/create-subnet", async (req, res) => {
   }
 });
 
+app.get("/api/my-ip", async (_req, res) => {
+  try {
+    const response = await fetch("https://api.ipify.org?format=json", { signal: AbortSignal.timeout(4000) });
+    const data = await response.json();
+    if (data.ip) {
+      return res.json({ ok: true, ip: data.ip, cidr: `${data.ip}/32` });
+    }
+  } catch {}
+  res.json({ ok: false, error: "Could not auto-detect server public IP" });
+});
+
 app.post("/api/create-security-group", async (req, res) => {
   const missing = [...NETWORK_CRED_REQUIRED, "name"].filter((f) => !String(req.body?.[f] ?? "").trim());
   if (missing.length) return res.status(400).json({ ok: false, error: `Missing: ${missing.join(", ")}` });
@@ -343,7 +405,11 @@ app.post("/api/create-security-group", async (req, res) => {
       req.body.secretKey.trim(),
       String(req.body.projectId || "").trim() || undefined,
       req.body.region.trim(),
-      { name: req.body.name.trim(), description: String(req.body.description || "").trim() || undefined }
+      {
+        name: req.body.name.trim(),
+        description: String(req.body.description || "").trim() || undefined,
+        rules: Array.isArray(req.body.rules) ? req.body.rules : undefined,
+      }
     );
     res.json({ ok: true, securityGroup: sg });
   } catch (err) {
@@ -351,6 +417,7 @@ app.post("/api/create-security-group", async (req, res) => {
     res.status(502).json({ ok: false, error: message });
   }
 });
+
 
 app.post("/api/validate", (req, res) => {
   // Never echo secrets back; body is validated then stripped from logs.
@@ -482,6 +549,132 @@ app.post("/api/windows-automation-upload", upload.single("appZip"), async (req, 
     } finally {
       job.updatedAt = new Date().toISOString();
       // Clean up the temp uploaded zip
+      import("node:fs").then((fsMod) => fsMod.default.unlink(job._zipPath, () => {})).catch(() => {});
+    }
+  })();
+
+  res.status(202).json(publicJob(job));
+});
+
+// ── Linux Automation: GitHub repository deployment ──────────────────────────
+app.post("/api/linux-automation", (req, res) => {
+  const { host, username, password, privateKey, repoUrl, branch, githubToken } = req.body || {};
+  if (!String(host || "").trim()) {
+    return res.status(400).json({ ok: false, error: "Host (Public IP) is required" });
+  }
+  if (!String(password || "").trim() && !String(privateKey || "").trim()) {
+    return res.status(400).json({ ok: false, error: "Either SSH Password or Private Key is required" });
+  }
+  if (!String(repoUrl || "").trim()) {
+    return res.status(400).json({ ok: false, error: "GitHub repository URL is required" });
+  }
+
+  const id = uuidv4();
+  const now = new Date().toISOString();
+  const job = {
+    id,
+    mode: "linux-automation",
+    status: "queued",
+    createdAt: now,
+    updatedAt: now,
+    logs: [],
+    error: null,
+    outputs: null,
+    config: {
+      host: String(host).trim(),
+      username: String(username || "root").trim(),
+      repoUrl: String(repoUrl).trim(),
+      branch: String(branch || "main").trim(),
+      githubToken: String(githubToken || "").trim(),
+    },
+    _credentials: {
+      password: String(password || ""),
+      privateKey: String(privateKey || ""),
+    },
+  };
+
+  jobs.set(id, job);
+  void executeLinuxJob(job);
+  res.status(202).json(publicJob(job));
+});
+
+// ── Linux Automation: File upload mode (.zip to web server) ─────────────────
+app.post("/api/linux-automation-upload", upload.single("appZip"), async (req, res) => {
+  const { host, username, password, privateKey } = req.body || {};
+  if (!String(host || "").trim()) {
+    return res.status(400).json({ ok: false, error: "Host (Public IP) is required" });
+  }
+  if (!String(password || "").trim() && !String(privateKey || "").trim()) {
+    return res.status(400).json({ ok: false, error: "Either SSH Password or Private Key is required" });
+  }
+  if (!req.file) {
+    return res.status(400).json({ ok: false, error: "A .zip file is required (field: appZip)" });
+  }
+
+  const id = uuidv4();
+  const now = new Date().toISOString();
+  const job = {
+    id,
+    mode: "linux-upload",
+    status: "queued",
+    createdAt: now,
+    updatedAt: now,
+    logs: [],
+    error: null,
+    outputs: null,
+    config: {
+      host: String(host).trim(),
+      username: String(username || "root").trim(),
+      uploadedName: req.file.originalname,
+    },
+    _credentials: {
+      password: String(password || ""),
+      privateKey: String(privateKey || ""),
+    },
+    _zipPath: req.file.path,
+  };
+
+  jobs.set(id, job);
+
+  // Run the Linux upload job asynchronously
+  void (async () => {
+    job.status = "running";
+    job.updatedAt = new Date().toISOString();
+    appendLog(job, { level: "info", message: "linux-upload job started" });
+    try {
+      const result = await runLinuxUploadJob({
+        jobId: job.id,
+        host: job.config.host,
+        username: job.config.username,
+        password: job._credentials.password,
+        privateKey: job._credentials.privateKey,
+        zipPath: job._zipPath,
+        uploadedName: job.config.uploadedName,
+        onLog: (entry) => appendLog(job, entry),
+      });
+
+      job._credentials = null;
+
+      if (!result.ok) {
+        job.status = "failed";
+        job.error = result.error || "Linux upload deployment failed";
+        job.outputs = result.outputs || null;
+        if (result.script && job.outputs) job.outputs.script = result.script;
+        appendLog(job, { level: "error", message: job.error });
+        return;
+      }
+
+      job.status = "succeeded";
+      job.outputs = result.outputs;
+      if (result.script) job.outputs.script = result.script;
+      appendLog(job, { level: "info", message: `Linux upload deployment complete. Live URL: ${result.websiteUrl}` });
+    } catch (err) {
+      job._credentials = null;
+      job.status = "failed";
+      job.error = err?.message || String(err);
+      appendLog(job, { level: "error", message: job.error });
+    } finally {
+      job.updatedAt = new Date().toISOString();
       import("node:fs").then((fsMod) => fsMod.default.unlink(job._zipPath, () => {})).catch(() => {});
     }
   })();

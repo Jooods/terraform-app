@@ -84,3 +84,28 @@ export async function startWindowsUploadAutomation(formData) {
   return data;
 }
 
+export function getMyIp() {
+  return request("/api/my-ip");
+}
+
+export function startLinuxAutomation(payload) {
+  return request("/api/linux-automation", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function startLinuxUploadAutomation(formData) {
+  const res = await fetch("/api/linux-automation-upload", {
+    method: "POST",
+    body: formData,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.error || `Upload request failed (${res.status})`);
+  }
+  return data;
+}
+
+
+

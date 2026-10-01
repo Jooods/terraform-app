@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback, useMemo } from "react";
-import { getHealth, getJob, startDeploy, startValidate, lookup, startWindowsAutomation, startWindowsUploadAutomation, createVpc, createSubnet, createSecurityGroup } from "./api.js";
+import { getHealth, getJob, startDeploy, startValidate, lookup, startWindowsAutomation, startWindowsUploadAutomation, startLinuxAutomation, startLinuxUploadAutomation, createVpc, createSubnet, createSecurityGroup, getMyIp } from "./api.js";
 import {
   AZ_BY_REGION,
   DISK_TYPES,
@@ -131,6 +131,24 @@ const EMPTY_WIN_FORM = {
   appZipFile: null,
 };
 
+const EMPTY_LINUX_FORM = {
+  accessKey: "",
+  secretKey: "",
+  projectId: "",
+  region: "",
+  instanceId: "",
+  host: "",
+  username: "root",
+  authType: "password", // 'password' or 'key'
+  password: "",
+  privateKey: "",
+  sourceType: "github", // 'github' or 'file'
+  repoUrl: "",
+  branch: "main",
+  githubToken: "",
+  appZipFile: null,
+};
+
 export default function App() {
   const [form, setForm] = useState(EMPTY_FORM);
   const [errors, setErrors] = useState({});
@@ -163,6 +181,16 @@ export default function App() {
   const [winBanner, setWinBanner] = useState(null);
   const winPollRef = useRef(null);
 
+  // Linux Automation state
+  const [linuxForm, setLinuxForm] = useState(EMPTY_LINUX_FORM);
+  const [linuxErrors, setLinuxErrors] = useState({});
+  const [linuxInstances, setLinuxInstances] = useState([]);
+  const [loadingLinuxInstances, setLoadingLinuxInstances] = useState(false);
+  const [linuxJob, setLinuxJob] = useState(null);
+  const [linuxBusy, setLinuxBusy] = useState(false);
+  const [linuxBanner, setLinuxBanner] = useState(null);
+  const linuxPollRef = useRef(null);
+
   // Network Setup tab state
   const [netBanner, setNetBanner] = useState(null);
   // VPC creation
@@ -174,13 +202,22 @@ export default function App() {
   const [subnetCreating, setSubnetCreating] = useState(false);
   const [createdSubnet, setCreatedSubnet] = useState(null);
   // Security Group creation
-  const [sgForm, setSgForm] = useState({ name: "", description: "" });
+  const [sgForm, setSgForm] = useState({
+    name: "",
+    description: "",
+    ethertype: "IPv4",
+    protocol: "all",
+    portRange: "1-65535",
+    remoteIpPrefix: "",
+  });
+  const [detectingIp, setDetectingIp] = useState(false);
   const [sgCreating, setSgCreating] = useState(false);
   const [createdSg, setCreatedSg] = useState(null);
 
   useEffect(() => {
     return () => {
       if (winPollRef.current) clearInterval(winPollRef.current);
+      if (linuxPollRef.current) clearInterval(linuxPollRef.current);
     };
   }, []);
 
@@ -458,6 +495,124 @@ export default function App() {
     }
   }
 
+  function setLinuxField(key, value) {
+    setLinuxForm((prev) => ({ ...prev, [key]: value }));
+    setLinuxErrors((prev) => {
+      if (!prev[key]) return prev;
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+  }
+
+  async function loadLinuxInstances() {
+    const { accessKey, secretKey, projectId, region } = linuxForm;
+    if (!accessKey || !secretKey || !region) {
+      setLinuxBanner({ type: "error", text: "Fill in AK, SK, and Region before fetching instances." });
+      return;
+    }
+    setLoadingLinuxInstances(true);
+    setLinuxBanner(null);
+    try {
+      const res = await lookup({
+        accessKey: accessKey.trim(),
+        secretKey: secretKey.trim(),
+        projectId: projectId ? projectId.trim() : undefined,
+        region: region.trim(),
+        resource: "instances",
+      });
+      if (res.ok && Array.isArray(res.items)) {
+        setLinuxInstances(res.items);
+        setLinuxBanner({
+          type: "ok",
+          text: `Found ${res.items.length} ECS instance${res.items.length === 1 ? "" : "s"}.`,
+        });
+      } else {
+        setLinuxBanner({ type: "error", text: res.error || "Failed to fetch instances." });
+      }
+    } catch (err) {
+      setLinuxBanner({ type: "error", text: err.message });
+    } finally {
+      setLoadingLinuxInstances(false);
+    }
+  }
+
+  function startLinuxPolling(jobId) {
+    if (linuxPollRef.current) clearInterval(linuxPollRef.current);
+    linuxPollRef.current = setInterval(async () => {
+      try {
+        const next = await getJob(jobId);
+        setLinuxJob(next);
+        if (["succeeded", "failed"].includes(next.status)) {
+          clearInterval(linuxPollRef.current);
+          linuxPollRef.current = null;
+          setLinuxBusy(false);
+        }
+      } catch (err) {
+        clearInterval(linuxPollRef.current);
+        linuxPollRef.current = null;
+        setLinuxBusy(false);
+        setLinuxBanner({ type: "error", text: err.message });
+      }
+    }, 1500);
+  }
+
+  async function submitLinuxAutomation(e) {
+    e.preventDefault();
+    const errs = {};
+    if (!linuxForm.host.trim()) errs.host = "Required";
+    if (linuxForm.authType === "password" && !linuxForm.password.trim()) {
+      errs.password = "Required";
+    }
+    if (linuxForm.authType === "key" && !linuxForm.privateKey.trim()) {
+      errs.privateKey = "Required";
+    }
+
+    if (linuxForm.sourceType === "github") {
+      if (!linuxForm.repoUrl.trim()) errs.repoUrl = "Required";
+    } else if (linuxForm.sourceType === "file") {
+      if (!linuxForm.appZipFile) errs.appZipFile = "Please select a .zip file";
+    }
+
+    setLinuxErrors(errs);
+    if (Object.keys(errs).length) {
+      setLinuxBanner({ type: "error", text: "Fix the highlighted fields before continuing." });
+      return;
+    }
+    setLinuxBusy(true);
+    setLinuxBanner(null);
+    try {
+      let created;
+      if (linuxForm.sourceType === "github") {
+        created = await startLinuxAutomation({
+          host: linuxForm.host.trim(),
+          username: linuxForm.username.trim() || "root",
+          password: linuxForm.authType === "password" ? linuxForm.password : undefined,
+          privateKey: linuxForm.authType === "key" ? linuxForm.privateKey : undefined,
+          repoUrl: linuxForm.repoUrl.trim(),
+          branch: linuxForm.branch.trim() || "main",
+          githubToken: linuxForm.githubToken.trim() || undefined,
+        });
+      } else {
+        const formData = new FormData();
+        formData.append("host", linuxForm.host.trim());
+        formData.append("username", linuxForm.username.trim() || "root");
+        if (linuxForm.authType === "password") {
+          formData.append("password", linuxForm.password);
+        } else {
+          formData.append("privateKey", linuxForm.privateKey);
+        }
+        formData.append("appZip", linuxForm.appZipFile);
+        created = await startLinuxUploadAutomation(formData);
+      }
+      setLinuxJob(created);
+      startLinuxPolling(created.id);
+    } catch (err) {
+      setLinuxBusy(false);
+      setLinuxBanner({ type: "error", text: err.message });
+    }
+  }
+
   async function submit(mode) {
     setBanner(null);
     const clientErrors = validateClient(form);
@@ -553,8 +708,7 @@ export default function App() {
           <p className="eyebrow">Huawei Cloud</p>
           <h1>ECS Automation</h1>
           <p className="lede">
-            Provision new ECS instances via Terraform, or automate IIS deployment on existing
-            Windows servers. AK/SK go to the backend only — never stored or logged.
+            Provision new ECS instances via Terraform, or automate deployments on existing Windows (IIS) and Linux (httpd/apache2) servers. AK/SK go to the backend only — never stored or logged.
           </p>
         </div>
         <aside className="arch" aria-label="Sample guide">
@@ -607,6 +761,14 @@ export default function App() {
         >
           🪟 Windows Automation
         </button>
+        <button
+          role="tab"
+          aria-selected={activeTab === "linux"}
+          className={`nav-tab ${activeTab === "linux" ? "active" : ""}`}
+          onClick={() => setActiveTab("linux")}
+        >
+          🐧 Linux Automation
+        </button>
       </div>
 
       {/* Provision Tab banners */}
@@ -627,6 +789,13 @@ export default function App() {
       {activeTab === "windows" && winBanner && (
         <div className={`banner ${winBanner.type}`} role="alert">
           {winBanner.text}
+        </div>
+      )}
+
+      {/* Linux Tab banners */}
+      {activeTab === "linux" && linuxBanner && (
+        <div className={`banner ${linuxBanner.type}`} role="alert">
+          {linuxBanner.text}
         </div>
       )}
 
@@ -1382,6 +1551,422 @@ export default function App() {
         </div>
       )}
 
+      {/* ── Linux Automation Tab ─────────────────────────────── */}
+      {activeTab === "linux" && (
+        <div className="linux-panel">
+
+          {/* Step 1: Credentials */}
+          <div className="linux-section">
+            <h3>1 · Huawei Cloud Credentials</h3>
+            <p className="section-help">
+              Enter your AK/SK and region to fetch your existing Linux ECS instances, or quickly auto-fill from the Provision tab.
+            </p>
+            <div className="grid two">
+              <Field label="Access Key (AK)" name="accessKey" value={linuxForm.accessKey} error={linuxErrors.accessKey} onChange={setLinuxField} />
+              <Field label="Secret Key (SK)" name="secretKey" value={linuxForm.secretKey} error={linuxErrors.secretKey} type="password" autoComplete="new-password" onChange={setLinuxField} />
+              <Field label="Project ID (recommended)" name="projectId" value={linuxForm.projectId} onChange={setLinuxField} placeholder="Paste your regional project ID" />
+              <Select
+                label="Region"
+                name="region"
+                value={linuxForm.region}
+                onChange={setLinuxField}
+                options={[{ id: "", label: "Select region…" }, ...REGIONS]}
+              />
+            </div>
+            <div className="load-resources-row" style={{ display: "flex", gap: "0.75rem", flexWrap: "wrap", marginTop: "0.85rem" }}>
+              <button
+                type="button"
+                className="btn load-btn"
+                disabled={!linuxForm.accessKey || !linuxForm.secretKey || !linuxForm.region || loadingLinuxInstances}
+                onClick={loadLinuxInstances}
+              >
+                {loadingLinuxInstances ? (
+                  <><span className="spinner" /> Fetching instances…</>
+                ) : (
+                  "⬇ Fetch Existing ECS Instances"
+                )}
+              </button>
+              {form.accessKey && form.secretKey && form.region && (
+                <button
+                  type="button"
+                  className="btn"
+                  style={{ background: "rgba(61, 207, 142, 0.12)", color: "var(--accent)" }}
+                  onClick={() => {
+                    setLinuxField("accessKey", form.accessKey);
+                    setLinuxField("secretKey", form.secretKey);
+                    setLinuxField("projectId", form.projectId);
+                    setLinuxField("region", form.region);
+                    setLinuxBanner({ type: "ok", text: "Auto-filled credentials from Provision ECS tab." });
+                  }}
+                >
+                  📋 Use Credentials from ECS Provision Tab
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Step 2: Select Instance */}
+          {linuxInstances.length > 0 && (
+            <div className="linux-section">
+              <h3>2 · Select Linux ECS Instance</h3>
+              <p className="section-help">
+                Click a Linux instance to select it. The public IP will be auto-filled below.
+              </p>
+              {linuxInstances.map((inst) => (
+                <div
+                  key={inst.id}
+                  className={`instance-card ${linuxForm.instanceId === inst.id ? "selected" : ""}`}
+                  onClick={() => {
+                    setLinuxField("instanceId", inst.id);
+                    const publicIp = inst.publicIp || "";
+                    if (publicIp) setLinuxField("host", publicIp);
+                  }}
+                >
+                  <div className="instance-card-info">
+                    <div className="instance-card-name">{inst.name || inst.id}</div>
+                    <div className="instance-card-meta">
+                      {inst.flavorId} · Status: {inst.status}
+                      {inst.publicIp && ` · Public IP: ${inst.publicIp}`}
+                      {inst.privateIp && ` · Private IP: ${inst.privateIp}`}
+                    </div>
+                  </div>
+                  <span className="instance-os-badge">{inst.osType || "Linux"}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Step 3: Deploy Form */}
+          <form className="linux-section" onSubmit={submitLinuxAutomation}>
+            <h3>3 · Web Server (httpd / Apache) Deployment Configuration</h3>
+            <p className="section-help">
+              Enter your Linux server IP and SSH credentials, choose your application source (GitHub repository or direct file upload), and launch the multi-distro automation.
+            </p>
+
+            {/* Multi-distro intelligence card */}
+            <div style={{
+              background: "linear-gradient(135deg, rgba(61, 207, 142, 0.08), rgba(26, 38, 33, 0.7))",
+              border: "1px solid var(--accent-dim)",
+              borderRadius: "10px",
+              padding: "1rem 1.25rem",
+              marginBottom: "1.2rem",
+            }}>
+              <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", fontWeight: 600, color: "var(--accent)", marginBottom: "0.35rem" }}>
+                <span>🐧 Multi-Distribution Smart Engine</span>
+                <span className="pill ok" style={{ fontSize: "0.7rem", padding: "0.1rem 0.5rem" }}>Automatic Distro &amp; Syntax Matching</span>
+              </div>
+              <p style={{ margin: 0, fontSize: "0.84rem", color: "var(--text)", lineHeight: 1.55 }}>
+                The automation script dynamically detects the remote distribution via <code>/etc/os-release</code> using <code>if-elif-else</code> logic. It automatically selects:
+              </p>
+              <ul style={{ margin: "0.4rem 0 0", paddingLeft: "1.2rem", fontSize: "0.8rem", color: "var(--muted)", lineHeight: 1.5 }}>
+                <li><strong>Huawei Cloud EulerOS / openEuler / CentOS / RHEL / Rocky:</strong> <code>dnf/yum install -y httpd unzip curl</code> · <code>systemctl enable --now httpd</code></li>
+                <li><strong>Ubuntu / Debian:</strong> <code>apt-get install -y apache2 unzip curl</code> · <code>systemctl enable --now apache2</code></li>
+                <li><strong>Alpine Linux:</strong> <code>apk add apache2 unzip curl</code> · <code>rc-service apache2 restart</code></li>
+                <li><strong>SUSE / openSUSE:</strong> <code>zypper install apache2 unzip curl</code> · <code>systemctl enable --now apache2</code></li>
+                <li><strong>Firewall &amp; SELinux:</strong> Automatically configures <code>ufw</code> / <code>firewalld</code> (ports 80 &amp; 443) and sets SELinux contexts for <code>/var/www/html</code>.</li>
+              </ul>
+            </div>
+
+            <div className="grid two">
+              <Field
+                label="Linux Server Public IP"
+                name="host"
+                value={linuxForm.host}
+                error={linuxErrors.host}
+                placeholder="e.g. 121.36.x.x"
+                onChange={setLinuxField}
+              />
+              <Field
+                label="SSH Username"
+                name="username"
+                value={linuxForm.username}
+                placeholder="root (default)"
+                onChange={setLinuxField}
+              />
+            </div>
+
+            {/* SSH Authentication Method Selection */}
+            <div style={{ margin: "1rem 0" }}>
+              <label style={{ fontWeight: 600, display: "block", marginBottom: "0.5rem" }}>
+                SSH Authentication Method
+              </label>
+              <div style={{ display: "flex", gap: "1rem" }}>
+                <label
+                  style={{
+                    flex: 1,
+                    padding: "0.75rem 1rem",
+                    borderRadius: "8px",
+                    border: `2px solid ${linuxForm.authType === "password" ? "var(--accent)" : "var(--border)"}`,
+                    background: linuxForm.authType === "password" ? "rgba(61, 207, 142, 0.08)" : "transparent",
+                    cursor: "pointer",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "0.6rem",
+                  }}
+                >
+                  <input
+                    type="radio"
+                    name="authType"
+                    value="password"
+                    checked={linuxForm.authType === "password"}
+                    onChange={(e) => setLinuxField("authType", e.target.value)}
+                  />
+                  <span>🔑 Password</span>
+                </label>
+                <label
+                  style={{
+                    flex: 1,
+                    padding: "0.75rem 1rem",
+                    borderRadius: "8px",
+                    border: `2px solid ${linuxForm.authType === "key" ? "var(--accent)" : "var(--border)"}`,
+                    background: linuxForm.authType === "key" ? "rgba(61, 207, 142, 0.08)" : "transparent",
+                    cursor: "pointer",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "0.6rem",
+                  }}
+                >
+                  <input
+                    type="radio"
+                    name="authType"
+                    value="key"
+                    checked={linuxForm.authType === "key"}
+                    onChange={(e) => setLinuxField("authType", e.target.value)}
+                  />
+                  <span>📜 SSH Private Key (.pem)</span>
+                </label>
+              </div>
+            </div>
+
+            {linuxForm.authType === "password" ? (
+              <Field
+                label="SSH Root / User Password"
+                name="password"
+                value={linuxForm.password}
+                error={linuxErrors.password}
+                type="password"
+                autoComplete="new-password"
+                placeholder="Enter password configured for the Linux instance"
+                onChange={setLinuxField}
+              />
+            ) : (
+              <div style={{ marginBottom: "1rem" }}>
+                <label style={{ fontWeight: 600, display: "block", marginBottom: "0.4rem", fontSize: "0.85rem" }}>
+                  SSH Private Key (OpenSSH or RSA PEM)
+                </label>
+                <textarea
+                  rows={5}
+                  value={linuxForm.privateKey}
+                  placeholder="Paste private key content (e.g. -----BEGIN RSA PRIVATE KEY-----...)"
+                  style={{
+                    width: "100%",
+                    padding: "0.75rem",
+                    borderRadius: "8px",
+                    border: `1px solid ${linuxErrors.privateKey ? "var(--error)" : "var(--border)"}`,
+                    background: "var(--bg)",
+                    color: "inherit",
+                    fontFamily: "var(--mono)",
+                    fontSize: "0.78rem",
+                    resize: "vertical",
+                  }}
+                  onChange={(e) => setLinuxField("privateKey", e.target.value)}
+                />
+                {linuxErrors.privateKey && (
+                  <span style={{ color: "var(--error)", fontSize: "0.82rem" }}>{linuxErrors.privateKey}</span>
+                )}
+              </div>
+            )}
+
+            {/* Application Source Selection */}
+            <div style={{ margin: "1.2rem 0" }}>
+              <label style={{ fontWeight: 600, display: "block", marginBottom: "0.6rem" }}>
+                Application Source
+              </label>
+              <div style={{ display: "flex", gap: "1rem" }}>
+                <label
+                  style={{
+                    flex: 1,
+                    padding: "0.8rem 1rem",
+                    borderRadius: "8px",
+                    border: `2px solid ${linuxForm.sourceType === "github" ? "var(--accent)" : "var(--border)"}`,
+                    background: linuxForm.sourceType === "github" ? "rgba(61, 207, 142, 0.08)" : "transparent",
+                    cursor: "pointer",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "0.6rem",
+                    transition: "all 0.2s ease",
+                  }}
+                >
+                  <input
+                    type="radio"
+                    name="linuxSourceType"
+                    value="github"
+                    checked={linuxForm.sourceType === "github"}
+                    onChange={(e) => setLinuxField("sourceType", e.target.value)}
+                  />
+                  <span>📦 GitHub Repository</span>
+                </label>
+                <label
+                  style={{
+                    flex: 1,
+                    padding: "0.8rem 1rem",
+                    borderRadius: "8px",
+                    border: `2px solid ${linuxForm.sourceType === "file" ? "var(--accent)" : "var(--border)"}`,
+                    background: linuxForm.sourceType === "file" ? "rgba(61, 207, 142, 0.08)" : "transparent",
+                    cursor: "pointer",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "0.6rem",
+                    transition: "all 0.2s ease",
+                  }}
+                >
+                  <input
+                    type="radio"
+                    name="linuxSourceType"
+                    value="file"
+                    checked={linuxForm.sourceType === "file"}
+                    onChange={(e) => setLinuxField("sourceType", e.target.value)}
+                  />
+                  <span>📁 Upload Zip Folder</span>
+                </label>
+              </div>
+            </div>
+
+            {linuxForm.sourceType === "github" ? (
+              <div className="grid two">
+                <Field
+                  label="GitHub Repository URL"
+                  name="repoUrl"
+                  value={linuxForm.repoUrl}
+                  error={linuxErrors.repoUrl}
+                  placeholder="https://github.com/owner/repo  or  owner/repo"
+                  onChange={setLinuxField}
+                />
+                <Field
+                  label="Branch (default: main)"
+                  name="branch"
+                  value={linuxForm.branch}
+                  onChange={setLinuxField}
+                  placeholder="main"
+                />
+                <Field
+                  label="GitHub Token (for private repos)"
+                  name="githubToken"
+                  value={linuxForm.githubToken}
+                  type="password"
+                  autoComplete="new-password"
+                  placeholder="Optional — leave blank for public repos"
+                  onChange={setLinuxField}
+                />
+              </div>
+            ) : (
+              <div style={{ background: "var(--surface-hover)", padding: "1.2rem", borderRadius: "8px", marginTop: "1rem" }}>
+                <label style={{ fontWeight: 600, display: "block", marginBottom: "0.4rem" }}>
+                  Upload Static Web App (.zip)
+                </label>
+                <p style={{ fontSize: "0.85rem", color: "var(--muted)", marginBottom: "0.8rem" }}>
+                  Zip your static web application folder (containing <code>index.html</code>, <code>css/</code>, <code>js/</code>, assets). It will be unzipped and deployed directly to <code>/var/www/html</code>.
+                </p>
+                <input
+                  type="file"
+                  accept=".zip"
+                  style={{ display: "block", width: "100%", padding: "0.5rem", borderRadius: "6px", border: "1px solid var(--border)", background: "var(--bg)" }}
+                  onChange={(e) => {
+                    const file = e.target.files?.[0] || null;
+                    setLinuxField("appZipFile", file);
+                  }}
+                />
+                {linuxErrors.appZipFile && (
+                  <span style={{ color: "var(--error)", fontSize: "0.85rem", marginTop: "0.4rem", display: "block" }}>
+                    {linuxErrors.appZipFile}
+                  </span>
+                )}
+                {linuxForm.appZipFile && (
+                  <div style={{ fontSize: "0.85rem", color: "var(--accent)", marginTop: "0.5rem" }}>
+                    Selected: <strong>{linuxForm.appZipFile.name}</strong> ({(linuxForm.appZipFile.size / 1024 / 1024).toFixed(2)} MB)
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div className="actions" style={{ marginTop: "1.4rem" }}>
+              <button type="submit" className="btn primary" disabled={linuxBusy}>
+                {linuxBusy ? <><span className="spinner" /> Running Linux automation…</> : "🚀 Deploy to Linux ECS"}
+              </button>
+            </div>
+          </form>
+
+          {/* Step 4: Job Status */}
+          {linuxJob && (
+            <div className="linux-section">
+              <h3>4 · Automation Status</h3>
+              <div className="job-meta">
+                <span className={`pill ${statusTone(linuxJob.status)}`}>{linuxJob.status}</span>
+                <span className="mono muted">{linuxJob.mode}</span>
+                <span className="mono muted truncate" title={linuxJob.id}>{linuxJob.id}</span>
+              </div>
+
+              {linuxJob.error && (
+                <div className="banner error compact">{linuxJob.error}</div>
+              )}
+
+              {/* Show live website URL only on success */}
+              {linuxJob.status === "succeeded" && linuxJob.outputs?.websiteUrl && (
+                <div className="success-link-card">
+                  <span className="link-icon">🌐</span>
+                  <div>
+                    <div><a href={linuxJob.outputs.websiteUrl} target="_blank" rel="noreferrer">{linuxJob.outputs.websiteUrl}</a></div>
+                    <div className="success-link-label">Your Linux web server (httpd/apache2) is live at this address</div>
+                  </div>
+                </div>
+              )}
+
+              {/* 1-click fallback Bash script */}
+              {linuxJob.outputs?.script && (
+                <div className="script-box">
+                  <div className="script-header">
+                    <span>📋 1-Click Bash Script — run directly on the Linux server if SSH is blocked or via VNC console</span>
+                    <button
+                      type="button"
+                      className="btn-link"
+                      onClick={() => {
+                        navigator.clipboard.writeText(linuxJob.outputs.script).catch(() => {});
+                      }}
+                    >
+                      Copy Script
+                    </button>
+                  </div>
+                  <pre>{linuxJob.outputs.script}</pre>
+                </div>
+              )}
+
+              {linuxJob.outputs && (
+                <dl className="outputs">
+                  {Object.entries(linuxJob.outputs)
+                    .filter(([k]) => k !== "script")
+                    .map(([k, v]) => (
+                      <div key={k}>
+                        <dt>{k}</dt>
+                        <dd className="mono">{v == null ? "—" : String(v)}</dd>
+                      </div>
+                    ))}
+                </dl>
+              )}
+
+              <div className="log" aria-live="polite">
+                {(linuxJob.logs || []).map((line, i) => (
+                  <div key={`${line.ts}-${i}`} className={`log-line ${line.level}`}>
+                    <time>{new Date(line.ts).toLocaleTimeString()}</time>
+                    <pre>{line.message}</pre>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+        </div>
+      )}
+
       {/* ── Network Setup Tab ── */}
       {activeTab === "network" && (
         <div className="layout" style={{ display: "flex", flexDirection: "column", gap: "1.5rem" }}>
@@ -1658,6 +2243,18 @@ export default function App() {
                     <div><dt>Name</dt><dd className="mono">{createdSg.name}</dd></div>
                     <div><dt>ID</dt><dd className="mono">{createdSg.id}</dd></div>
                     {createdSg.description && <div><dt>Description</dt><dd className="mono">{createdSg.description}</dd></div>}
+                    {createdSg.rules && createdSg.rules.length > 0 && (
+                      <div>
+                        <dt>Configured Rules</dt>
+                        <dd className="mono">
+                          {createdSg.rules.map((r, idx) => (
+                            <div key={idx} style={{ fontSize: "0.85rem", marginTop: "0.2rem" }}>
+                              Allow {r.ethertype} · {r.protocol.toUpperCase()} · Ports: {r.portRange} · Source: {r.remoteIpPrefix}
+                            </div>
+                          ))}
+                        </dd>
+                      </div>
+                    )}
                   </dl>
                   <div style={{ display: "flex", gap: "0.75rem", marginTop: "0.85rem", flexWrap: "wrap" }}>
                     <button
@@ -1691,6 +2288,15 @@ export default function App() {
                     setSgCreating(true);
                     setNetBanner(null);
                     try {
+                      const rules = [
+                        {
+                          direction: "ingress",
+                          ethertype: sgForm.ethertype,
+                          protocol: sgForm.protocol,
+                          portRange: sgForm.protocol === "icmp" ? "" : sgForm.portRange || "1-65535",
+                          remoteIpPrefix: sgForm.remoteIpPrefix.trim() || "0.0.0.0/0",
+                        },
+                      ];
                       const res = await createSecurityGroup({
                         accessKey: form.accessKey.trim(),
                         secretKey: form.secretKey.trim(),
@@ -1698,6 +2304,7 @@ export default function App() {
                         region: form.region.trim(),
                         name: sgForm.name.trim(),
                         description: sgForm.description.trim() || undefined,
+                        rules,
                       });
                       setCreatedSg(res.securityGroup);
                       setNetBanner({ type: "ok", text: `Security Group "${res.securityGroup.name}" created successfully (ID: ${res.securityGroup.id}).` });
@@ -1724,6 +2331,153 @@ export default function App() {
                       onChange={(_, v) => setSgForm((p) => ({ ...p, description: v }))}
                     />
                   </div>
+
+                  {/* Security Group Inbound Rule Configuration */}
+                  <div style={{ marginTop: "1.2rem", padding: "1.2rem", background: "var(--surface-hover)", borderRadius: "8px", border: "1px solid var(--border)" }}>
+                    <h4 style={{ margin: "0 0 0.8rem 0", color: "var(--accent)" }}>
+                      🛡️ Inbound Rule Configuration
+                    </h4>
+
+                    <div className="grid two" style={{ marginBottom: "1rem" }}>
+                      <div>
+                        <label style={{ fontWeight: 600, display: "block", marginBottom: "0.4rem", fontSize: "0.85rem" }}>
+                          Ethertype
+                        </label>
+                        <select
+                          value={sgForm.ethertype}
+                          onChange={(e) => setSgForm((p) => ({ ...p, ethertype: e.target.value }))}
+                          style={{ width: "100%", padding: "0.55rem", borderRadius: "6px", border: "1px solid var(--border)", background: "var(--bg)", color: "inherit" }}
+                        >
+                          <option value="IPv4">IPv4</option>
+                          <option value="IPv6">IPv6</option>
+                        </select>
+                      </div>
+
+                      <div>
+                        <label style={{ fontWeight: 600, display: "block", marginBottom: "0.4rem", fontSize: "0.85rem" }}>
+                          Protocol
+                        </label>
+                        <select
+                          value={sgForm.protocol}
+                          onChange={(e) => {
+                            const proto = e.target.value;
+                            setSgForm((p) => ({
+                              ...p,
+                              protocol: proto,
+                              portRange: proto === "all" ? "1-65535" : proto === "icmp" ? "" : p.portRange || "1-65535",
+                            }));
+                          }}
+                          style={{ width: "100%", padding: "0.55rem", borderRadius: "6px", border: "1px solid var(--border)", background: "var(--bg)", color: "inherit" }}
+                        >
+                          <option value="all">Protocols / All (Ports 1-65535)</option>
+                          <option value="tcp">TCP</option>
+                          <option value="udp">UDP</option>
+                          <option value="icmp">ICMP</option>
+                        </select>
+                      </div>
+                    </div>
+
+                    {/* Port Range (when protocol is tcp, udp, or all) */}
+                    {sgForm.protocol !== "icmp" && (
+                      <div style={{ marginBottom: "1rem" }}>
+                        <Field
+                          label="Port Range"
+                          name="portRange"
+                          value={sgForm.portRange}
+                          placeholder="e.g. 1-65535 or 80, 443, 22, 3389"
+                          onChange={(_, v) => setSgForm((p) => ({ ...p, portRange: v }))}
+                        />
+                        <div style={{ display: "flex", gap: "0.4rem", flexWrap: "wrap", marginTop: "0.4rem" }}>
+                          <span style={{ fontSize: "0.78rem", color: "var(--muted)", alignSelf: "center" }}>Presets:</span>
+                          <button
+                            type="button"
+                            className="btn"
+                            style={{ padding: "0.2rem 0.5rem", fontSize: "0.78rem" }}
+                            onClick={() => setSgForm((p) => ({ ...p, portRange: "1-65535" }))}
+                          >
+                            1-65535 (All Ports)
+                          </button>
+                          <button
+                            type="button"
+                            className="btn"
+                            style={{ padding: "0.2rem 0.5rem", fontSize: "0.78rem" }}
+                            onClick={() => setSgForm((p) => ({ ...p, protocol: "tcp", portRange: "80" }))}
+                          >
+                            80 (HTTP)
+                          </button>
+                          <button
+                            type="button"
+                            className="btn"
+                            style={{ padding: "0.2rem 0.5rem", fontSize: "0.78rem" }}
+                            onClick={() => setSgForm((p) => ({ ...p, protocol: "tcp", portRange: "443" }))}
+                          >
+                            443 (HTTPS)
+                          </button>
+                          <button
+                            type="button"
+                            className="btn"
+                            style={{ padding: "0.2rem 0.5rem", fontSize: "0.78rem" }}
+                            onClick={() => setSgForm((p) => ({ ...p, protocol: "tcp", portRange: "3389" }))}
+                          >
+                            3389 (RDP)
+                          </button>
+                          <button
+                            type="button"
+                            className="btn"
+                            style={{ padding: "0.2rem 0.5rem", fontSize: "0.78rem" }}
+                            onClick={() => setSgForm((p) => ({ ...p, protocol: "tcp", portRange: "22" }))}
+                          >
+                            22 (SSH)
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Source IP / Remote CIDR */}
+                    <div>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.4rem" }}>
+                        <label style={{ fontWeight: 600, fontSize: "0.85rem" }}>
+                          Source IP Address (CIDR)
+                        </label>
+                        <button
+                          type="button"
+                          className="btn"
+                          disabled={detectingIp}
+                          style={{ padding: "0.25rem 0.6rem", fontSize: "0.78rem", background: "var(--accent)", color: "#fff" }}
+                          onClick={async () => {
+                            setDetectingIp(true);
+                            try {
+                              const data = await getMyIp();
+                              if (data.cidr) {
+                                setSgForm((p) => ({ ...p, remoteIpPrefix: data.cidr }));
+                                setNetBanner({ type: "ok", text: `Detected server IP: ${data.cidr}` });
+                              } else {
+                                setNetBanner({ type: "error", text: "Could not auto-detect IP." });
+                              }
+                            } catch (err) {
+                              setNetBanner({ type: "error", text: `IP detection failed: ${err.message}` });
+                            } finally {
+                              setDetectingIp(false);
+                            }
+                          }}
+                        >
+                          {detectingIp ? <><span className="spinner" /> Detecting…</> : "🌐 Detect My Current IP"}
+                        </button>
+                      </div>
+
+                      <Field
+                        label=""
+                        name="remoteIpPrefix"
+                        value={sgForm.remoteIpPrefix}
+                        placeholder="e.g. 10.0.0.5/32, 10.1.0.0/24 (leave blank for 0.0.0.0/0)"
+                        onChange={(_, v) => setSgForm((p) => ({ ...p, remoteIpPrefix: v }))}
+                      />
+                      <p style={{ margin: "0.3rem 0 0 0", fontSize: "0.78rem", color: "var(--muted)" }}>
+                        Example: <code>10.0.0.5/32, 10.1.0.0/24</code> or <code>0.0.0.0/0</code>. Multiple IPs can be comma-separated.
+                      </p>
+                    </div>
+                  </div>
+
                   <div className="form-actions">
                     <button type="submit" className="btn primary" disabled={sgCreating || !sgForm.name.trim()}>
                       {sgCreating ? <><span className="spinner" /> Creating…</> : "Create Security Group"}
