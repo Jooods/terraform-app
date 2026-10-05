@@ -10,7 +10,9 @@ async function request(path, options = {}) {
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    throw new Error(data.error || `Request failed (${res.status})`);
+    const err = new Error(data.error || `Request failed (${res.status})`);
+    if (data.securityGroup) err.securityGroup = data.securityGroup;
+    throw err;
   }
   return data;
 }

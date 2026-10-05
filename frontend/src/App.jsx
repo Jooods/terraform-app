@@ -2232,9 +2232,9 @@ export default function App() {
             <section>
               <h2>Step 3 — Create Security Group</h2>
               <p className="section-help">
-                A Security Group acts as a virtual firewall for your ECS instances, controlling inbound and
-                outbound traffic. Default rules will be created automatically — you can refine them in the
-                Huawei Cloud Console afterwards.
+                A Security Group is a virtual firewall. Huawei Cloud always adds a default inbound rule whose
+                <strong> source is this security group itself</strong>. This form removes that default ingress
+                rule and creates an inbound rule whose source is the IP/CIDR you enter.
               </p>
               {createdSg ? (
                 <div className="net-result-card">
@@ -2288,13 +2288,20 @@ export default function App() {
                     setSgCreating(true);
                     setNetBanner(null);
                     try {
+                      if (!sgForm.remoteIpPrefix.trim()) {
+                        setNetBanner({
+                          type: "error",
+                          text: "Enter a source IP/CIDR (or click Detect My Current IP). Otherwise Huawei uses this security group as the source.",
+                        });
+                        return;
+                      }
                       const rules = [
                         {
                           direction: "ingress",
                           ethertype: sgForm.ethertype,
                           protocol: sgForm.protocol,
                           portRange: sgForm.protocol === "icmp" ? "" : sgForm.portRange || "1-65535",
-                          remoteIpPrefix: sgForm.remoteIpPrefix.trim() || "0.0.0.0/0",
+                          remoteIpPrefix: sgForm.remoteIpPrefix.trim(),
                         },
                       ];
                       const res = await createSecurityGroup({
@@ -2302,13 +2309,21 @@ export default function App() {
                         secretKey: form.secretKey.trim(),
                         projectId: form.projectId || undefined,
                         region: form.region.trim(),
+                        vpcId: createdVpc?.id || form.vpcId || undefined,
                         name: sgForm.name.trim(),
                         description: sgForm.description.trim() || undefined,
                         rules,
                       });
                       setCreatedSg(res.securityGroup);
-                      setNetBanner({ type: "ok", text: `Security Group "${res.securityGroup.name}" created successfully (ID: ${res.securityGroup.id}).` });
+                      const warn = res.securityGroup?.warnings?.length
+                        ? ` Warnings: ${res.securityGroup.warnings.join("; ")}`
+                        : "";
+                      setNetBanner({
+                        type: "ok",
+                        text: `Security Group "${res.securityGroup.name}" created (ID: ${res.securityGroup.id}). Inbound source is your IP/CIDR, not the security group.${warn}`,
+                      });
                     } catch (err) {
+                      if (err.securityGroup) setCreatedSg(err.securityGroup);
                       setNetBanner({ type: "error", text: `Failed to create Security Group: ${err.message}` });
                     } finally {
                       setSgCreating(false);

@@ -408,13 +408,18 @@ app.post("/api/create-security-group", async (req, res) => {
       {
         name: req.body.name.trim(),
         description: String(req.body.description || "").trim() || undefined,
+        vpcId: String(req.body.vpcId || "").trim() || undefined,
         rules: Array.isArray(req.body.rules) ? req.body.rules : undefined,
       }
     );
     res.json({ ok: true, securityGroup: sg });
   } catch (err) {
     const message = err?.errorMsg || err?.data?.error_msg || err?.data?.message || err?.message || String(err);
-    res.status(502).json({ ok: false, error: message });
+    res.status(502).json({
+      ok: false,
+      error: message,
+      securityGroup: err.securityGroup || undefined,
+    });
   }
 });
 

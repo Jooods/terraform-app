@@ -400,92 +400,216 @@ export async function createSubnet(ak, sk, projectId, region, { name, cidr, vpcI
   };
 }
 
+function sdkErrorMessage(err) {
+  return (
+    err?.errorMsg ||
+    err?.error_msg ||
+    err?.data?.error_msg ||
+    err?.data?.error?.message ||
+    err?.data?.message ||
+    err?.message ||
+    String(err)
+  );
+}
+
+function pick(obj, camel, snake) {
+  if (!obj || typeof obj !== "object") return undefined;
+  return obj[camel] ?? obj[snake];
+}
+
+function normalizeCidr(raw, ethertype = "IPv4") {
+  let prefix = String(raw || "").trim();
+  if (!prefix) return "";
+  if (prefix.includes("/")) return prefix;
+  if (ethertype === "IPv6") {
+    if (prefix === "::") return "::/0";
+    return `${prefix}/128`;
+  }
+  if (prefix === "0.0.0.0") return "0.0.0.0/0";
+  return `${prefix}/32`;
+}
+
+function parsePortSpecs(portRange) {
+  const raw = String(portRange || "").trim();
+  if (!raw) return [null];
+  const tokens = raw.split(/[,\s]+/).map((t) => t.trim()).filter(Boolean);
+  const specs = [];
+  for (const token of tokens) {
+    if (token.includes("-")) {
+      const [minStr, maxStr] = token.split("-").map((p) => p.trim());
+      const min = Number(minStr);
+      const max = Number(maxStr);
+      if (!Number.isFinite(min) || !Number.isFinite(max)) {
+        throw new Error(`Invalid port range: ${token}`);
+      }
+      specs.push({ min, max, label: `${min}-${max}` });
+    } else {
+      const port = Number(token);
+      if (!Number.isFinite(port)) throw new Error(`Invalid port: ${token}`);
+      specs.push({ min: port, max: port, label: String(port) });
+    }
+  }
+  return specs.length ? specs : [null];
+}
+
+async function deleteDefaultSelfSourceIngress(client, sgId, existingRules) {
+  const removed = [];
+  for (const rule of existingRules || []) {
+    const direction = pick(rule, "direction", "direction");
+    const remoteGroupId = pick(rule, "remoteGroupId", "remote_group_id");
+    const ruleId = pick(rule, "id", "id");
+    if (!ruleId || direction !== "ingress" || !remoteGroupId) continue;
+    const del = new VpcSdk.DeleteSecurityGroupRuleRequest();
+    del.securityGroupRuleId = ruleId;
+    await client.deleteSecurityGroupRule(del);
+    removed.push(ruleId);
+  }
+  return removed;
+}
+
+async function addSecurityGroupRule(client, { sgId, direction, ethertype, protocol, portSpec, remoteIpPrefix }) {
+  const opt = new VpcSdk.CreateSecurityGroupRuleOption();
+  opt.withSecurityGroupId(sgId).withDirection(direction).withEthertype(ethertype);
+  opt.withRemoteIpPrefix(remoteIpPrefix);
+  // Never set remoteGroupId — that makes Source = this SG.
+
+  const proto = String(protocol || "all").toLowerCase();
+  if (proto && proto !== "all") {
+    opt.withProtocol(proto);
+  }
+  if (portSpec && proto !== "all" && proto !== "icmp" && proto !== "icmpv6") {
+    opt.withPortRangeMin(portSpec.min).withPortRangeMax(portSpec.max);
+  }
+
+  const ruleReq = new VpcSdk.CreateSecurityGroupRuleRequest();
+  const ruleBody = new VpcSdk.CreateSecurityGroupRuleRequestBody();
+  ruleBody.securityGroupRule = opt;
+  ruleReq.body = ruleBody;
+
+  const ruleRes = await client.createSecurityGroupRule(ruleReq);
+  const created = pick(ruleRes, "securityGroupRule", "security_group_rule");
+  if (!created) {
+    throw new Error("Huawei Cloud did not return the created security group rule");
+  }
+  return created;
+}
+
 /**
  * Create a new Security Group and configure security group rules.
- * @param {string} ak @param {string} sk @param {string|undefined} projectId
- * @param {string} region
- * @param {{ name: string, description?: string, rules?: Array<{ direction?: string, ethertype?: string, protocol?: string, portRange?: string, remoteIpPrefix?: string }> }} opts
+ * Huawei always adds a default inbound rule whose source is the new SG itself.
+ * That default ingress rule is removed and replaced with the CIDR the user entered.
  */
-export async function createSecurityGroup(ak, sk, projectId, region, { name, description, rules }) {
+export async function createSecurityGroup(ak, sk, projectId, region, { name, description, vpcId, rules }) {
   const client = buildVpcClient(ak, sk, projectId, region);
   const request = new VpcSdk.CreateSecurityGroupRequest();
   const body = new VpcSdk.CreateSecurityGroupRequestBody();
   const sg = new VpcSdk.CreateSecurityGroupOption();
   sg.name = name;
   if (description) sg.description = description;
+  if (vpcId) sg.vpcId = vpcId;
   body.securityGroup = sg;
   request.body = body;
+
   const response = await client.createSecurityGroup(request);
-  const g = response.securityGroup;
+  const g = pick(response, "securityGroup", "security_group");
+  if (!g?.id) {
+    throw new Error("Huawei Cloud created a security group but the response did not include its ID");
+  }
+
+  let defaultRules = pick(g, "securityGroupRules", "security_group_rules") || [];
+  if (!defaultRules.length) {
+    try {
+      const listReq = new VpcSdk.ListSecurityGroupRulesRequest();
+      listReq.securityGroupId = g.id;
+      listReq.limit = 200;
+      const listRes = await client.listSecurityGroupRules(listReq);
+      defaultRules = pick(listRes, "securityGroupRules", "security_group_rules") || [];
+    } catch (listErr) {
+      console.warn("Could not list default security group rules:", sdkErrorMessage(listErr));
+    }
+  }
+  let removedSelfSource = [];
+  try {
+    removedSelfSource = await deleteDefaultSelfSourceIngress(client, g.id, defaultRules);
+  } catch (delErr) {
+    console.warn("Could not remove default self-source ingress rule:", sdkErrorMessage(delErr));
+  }
+
   const createdRules = [];
+  const ruleErrors = [];
 
   if (rules && Array.isArray(rules) && rules.length > 0) {
     for (const ruleItem of rules) {
       const direction = ruleItem.direction || "ingress";
       const ethertype = ruleItem.ethertype || "IPv4";
       const protocol = ruleItem.protocol || "all";
-      const rawPrefixes = String(ruleItem.remoteIpPrefix || "0.0.0.0/0").split(",");
+      const prefixes = String(ruleItem.remoteIpPrefix || "")
+        .split(",")
+        .map((p) => normalizeCidr(p, ethertype))
+        .filter(Boolean);
 
-      for (let rawPrefix of rawPrefixes) {
-        let prefix = rawPrefix.trim();
-        if (!prefix) continue;
-        if (!prefix.includes("/")) {
-          prefix = prefix === "0.0.0.0" ? "0.0.0.0/0" : `${prefix}/32`;
-        }
+      if (!prefixes.length) {
+        ruleErrors.push("Source IP / CIDR is required so the rule source is not the security group itself");
+        continue;
+      }
 
-        try {
-          const ruleReq = new VpcSdk.CreateSecurityGroupRuleRequest();
-          const ruleBody = new VpcSdk.CreateSecurityGroupRuleRequestBody();
-          const opt = new VpcSdk.CreateSecurityGroupRuleOption();
-          opt.securityGroupId = g.id;
-          opt.direction = direction;
-          opt.ethertype = ethertype;
+      let portSpecs;
+      try {
+        portSpecs =
+          protocol === "all" || protocol === "icmp" || protocol === "icmpv6"
+            ? [null]
+            : parsePortSpecs(ruleItem.portRange);
+      } catch (portErr) {
+        ruleErrors.push(portErr.message);
+        continue;
+      }
 
-          if (protocol !== "all") {
-            opt.protocol = protocol;
-          }
-
-          if (ruleItem.portRange && protocol !== "all" && protocol !== "icmp") {
-            const rangeStr = String(ruleItem.portRange).trim();
-            if (rangeStr.includes("-")) {
-              const parts = rangeStr.split("-").map((p) => Number(p.trim()));
-              if (Number.isFinite(parts[0])) opt.portRangeMin = parts[0];
-              if (Number.isFinite(parts[1])) opt.portRangeMax = parts[1];
-            } else if (Number.isFinite(Number(rangeStr))) {
-              const portNum = Number(rangeStr);
-              opt.portRangeMin = portNum;
-              opt.portRangeMax = portNum;
-            }
-          }
-
-          opt.remoteIpPrefix = prefix;
-          ruleBody.securityGroupRule = opt;
-          ruleReq.body = ruleBody;
-
-          const ruleRes = await client.createSecurityGroupRule(ruleReq);
-          if (ruleRes.securityGroupRule) {
-            createdRules.push({
-              id: ruleRes.securityGroupRule.id,
+      for (const prefix of prefixes) {
+        for (const portSpec of portSpecs) {
+          try {
+            const created = await addSecurityGroupRule(client, {
+              sgId: g.id,
               direction,
               ethertype,
               protocol,
-              portRange: ruleItem.portRange || "1-65535",
+              portSpec,
               remoteIpPrefix: prefix,
             });
+            createdRules.push({
+              id: created.id,
+              direction,
+              ethertype,
+              protocol,
+              portRange: portSpec?.label || (protocol === "icmp" ? "ICMP" : "all"),
+              remoteIpPrefix: pick(created, "remoteIpPrefix", "remote_ip_prefix") || prefix,
+              remoteGroupId: pick(created, "remoteGroupId", "remote_group_id") || "",
+            });
+          } catch (ruleErr) {
+            ruleErrors.push(`${prefix}: ${sdkErrorMessage(ruleErr)}`);
           }
-        } catch (ruleErr) {
-          console.warn("Notice when adding security group rule:", ruleErr?.errorMsg || ruleErr?.message || ruleErr);
         }
       }
     }
   }
 
-  return {
+  const result = {
     id: g.id,
     name: g.name,
     description: g.description,
     rules: createdRules,
+    removedSelfSourceRules: removedSelfSource.length,
+    warnings: ruleErrors,
   };
+
+  if (ruleErrors.length && createdRules.length === 0) {
+    const err = new Error(
+      `Security group "${g.name}" was created (${g.id}), but inbound IP rules were not added: ${ruleErrors.join("; ")}`
+    );
+    err.securityGroup = result;
+    throw err;
+  }
+
+  return result;
 }
 
 // ---------------------------------------------------------------------------
