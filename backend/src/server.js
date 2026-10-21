@@ -9,7 +9,6 @@ import { runLinuxAutomationJob, runLinuxUploadJob } from "./linuxWorker.js";
 import multer from "multer";
 import os from "node:os";
 import { lookup, createVpc, createSubnet, createSecurityGroup } from "./huaweiLookup.js";
-import crypto from "node:crypto";
 
 // Multer: store uploads in OS temp dir, accept only .zip, max 100 MB
 const upload = multer({
@@ -22,26 +21,6 @@ const upload = multer({
       cb(new Error("Only .zip files are accepted for upload deployment."));
     }
   },
-});
-
-const APP_USER = process.env.APP_USER || "admin";
-const APP_PASSWORD = process.env.APP_PASSWORD || "";
-if (process.env.NODE_ENV === "production" && !APP_PASSWORD) {
-  console.error("APP_PASSWORD must be set in production");
-  process.exit(1);
-}
-const safeEq = (a, b) => {
-  const x = Buffer.from(a), y = Buffer.from(b);
-  return x.length === y.length && crypto.timingSafeEqual(x, y);
-};
-
-app.use((req, res, next) => {
-  if (!APP_PASSWORD || req.path === "/api/health") return next();
-  const [user = "", pass = ""] = Buffer.from(
-    (req.headers.authorization || "").replace(/^Basic /, ""), "base64"
-  ).toString().split(/:(.*)/s);
-  if (safeEq(user, APP_USER) && safeEq(pass, APP_PASSWORD)) return next();
-  res.set("WWW-Authenticate", 'Basic realm="ECS Automation"').status(401).send("Login required");
 });
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -305,6 +284,7 @@ async function executeLinuxJob(job) {
 }
 
 const app = express();
+app.use(cors({ origin: true }));
 app.use(express.json({ limit: "256kb" }));
 
 app.get("/api/health", async (_req, res) => {
@@ -411,7 +391,7 @@ app.get("/api/my-ip", async (_req, res) => {
     if (data.ip) {
       return res.json({ ok: true, ip: data.ip, cidr: `${data.ip}/32` });
     }
-  } catch { }
+  } catch {}
   res.json({ ok: false, error: "Could not auto-detect server public IP" });
 });
 
@@ -574,7 +554,7 @@ app.post("/api/windows-automation-upload", upload.single("appZip"), async (req, 
     } finally {
       job.updatedAt = new Date().toISOString();
       // Clean up the temp uploaded zip
-      import("node:fs").then((fsMod) => fsMod.default.unlink(job._zipPath, () => { })).catch(() => { });
+      import("node:fs").then((fsMod) => fsMod.default.unlink(job._zipPath, () => {})).catch(() => {});
     }
   })();
 
@@ -700,7 +680,7 @@ app.post("/api/linux-automation-upload", upload.single("appZip"), async (req, re
       appendLog(job, { level: "error", message: job.error });
     } finally {
       job.updatedAt = new Date().toISOString();
-      import("node:fs").then((fsMod) => fsMod.default.unlink(job._zipPath, () => { })).catch(() => { });
+      import("node:fs").then((fsMod) => fsMod.default.unlink(job._zipPath, () => {})).catch(() => {});
     }
   })();
 

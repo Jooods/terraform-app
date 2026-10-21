@@ -5,9 +5,7 @@ import { spawn } from "node:child_process";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const TEMPLATE_DIR = path.resolve(__dirname, "../../terraform");
-const WORK_ROOT = process.env.WORK_DIR
-  ? path.resolve(process.env.WORK_DIR)
-  : path.resolve(__dirname, "../.work");
+const WORK_ROOT = path.resolve(__dirname, "../.work");
 
 const SENSITIVE_PATTERNS = [
   /HW_ACCESS_KEY[=:\s]+\S+/gi,
@@ -139,16 +137,16 @@ export async function runTerraformJob({
   const steps =
     mode === "validate"
       ? [
-        ["init", ["init", "-input=false", "-no-color"]],
-        ["validate", ["validate", "-no-color"]],
-        ["plan", ["plan", "-input=false", "-no-color", "-out=tfplan"]],
-      ]
+          ["init", ["init", "-input=false", "-no-color"]],
+          ["validate", ["validate", "-no-color"]],
+          ["plan", ["plan", "-input=false", "-no-color", "-out=tfplan"]],
+        ]
       : [
-        ["init", ["init", "-input=false", "-no-color"]],
-        ["validate", ["validate", "-no-color"]],
-        ["plan", ["plan", "-input=false", "-no-color", "-out=tfplan"]],
-        ["apply", ["apply", "-input=false", "-no-color", "-auto-approve", "tfplan"]],
-      ];
+          ["init", ["init", "-input=false", "-no-color"]],
+          ["validate", ["validate", "-no-color"]],
+          ["plan", ["plan", "-input=false", "-no-color", "-out=tfplan"]],
+          ["apply", ["apply", "-input=false", "-no-color", "-auto-approve", "tfplan"]],
+        ];
 
   const results = [];
 
